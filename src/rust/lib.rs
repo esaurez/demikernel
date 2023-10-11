@@ -32,6 +32,13 @@ extern crate log;
 #[macro_use]
 extern crate cfg_if;
 
+#[macro_use]
+extern crate nix;
+
+extern crate libc;
+
+extern crate lazy_static;
+
 #[cfg(feature = "catnip-libos")]
 mod catnip;
 

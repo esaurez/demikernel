@@ -6,9 +6,12 @@
 //======================================================================================================================
 // Imports
 //======================================================================================================================
+#[cfg(all(feature = "catmem-libos", not(feature = "vm-shmem")))]
+use crate::pal::linux::shm::SharedMemory;
+#[cfg(all(feature = "catmem-libos", feature = "vm-shmem"))]
+use crate::pal::linux::vm_shmem::SharedMemory;
 use crate::{
     collections::ring::Ring,
-    pal::linux::shm::SharedMemory,
     runtime::fail::Fail,
 };
 use ::std::ops::Deref;

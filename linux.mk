@@ -66,6 +66,12 @@ ifeq ($(PROFILER),yes)
 CARGO_FEATURES += --features=profiler
 endif
 
+# Enable VM Shared Memory
+export VM_SHM ?= no
+ifeq ($(VM_SHM),yes)
+CARGO_FEATURES += --features=vm-shmem
+endif
+
 CARGO_FEATURES += $(FEATURES)
 
 #=======================================================================================================================
@@ -187,6 +193,8 @@ export PEER ?= server
 export TEST ?= udp-push-pop
 export TEST_INTEGRATION ?= tcp-test
 export TIMEOUT ?= 120
+export IS_HOST ?= no
+export SHMEM_PATH ?= /ivshmem
 
 # Runs system tests.
 test-system: test-system-rust

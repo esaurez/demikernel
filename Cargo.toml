@@ -34,14 +34,17 @@ crossbeam-channel = "0.5.8"
 eui48 = "1.1.0"
 flexi_logger = "0.27.2"
 futures = "0.3.28"
+lazy_static = "1.4"
 libc = "0.2.148"
 log = "0.4.20"
+nix = { version = "0.27.1", features = ["ioctl"] }
 rand = { version = "0.8.5", features = ["small_rng"] }
 slab = "0.4.9"
 socket2 = "0.5.4"
 yaml-rust = "0.4.5"
 x86 = "0.52.0"
-
+zerocopy = "0.7.10"
+zerocopy-derive = "0.7.10"
 # Demikernel Organization
 liburing = { git = "https://github.com/demikernel/liburing-rs", rev = "780827ee3f805d94f9909bd47cd925ee8476a64b", optional = true }
 dpdk-rs = { git = "https://github.com/demikernel/dpdk-rs", rev = "5a339766b6f64c2b09c2e4089c62013bfb48297e", optional = true }
@@ -54,6 +57,9 @@ windows = { version = "0.51.1", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
 ] }
+
+[build-dependencies]
+cc = "1.0.83"
 
 #=======================================================================================================================
 # Targets
@@ -149,6 +155,7 @@ libdpdk = ["dpdk-rs"]
 mlx4 = ["dpdk-rs/mlx4"]
 mlx5 = ["dpdk-rs/mlx5"]
 profiler = []
+vm-shmem = []
 
 #=======================================================================================================================
 # Profile
