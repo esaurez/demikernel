@@ -17,6 +17,7 @@ use std::{
     slice,
     sync::{
         Arc,
+        Condvar,
         Mutex,
         RwLock,
         RwLockWriteGuard,
@@ -232,6 +233,7 @@ pub struct ShmemManager {
     segment_map: HashMap<String, RegionLocation>,
     pub size: u64,
     current_offset: u64,
+    init_wait: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl ShmemManager {
@@ -242,11 +244,29 @@ impl ShmemManager {
             segment_map: HashMap::new(),
             size: region_size,
             current_offset: 0,
+            init_wait: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
 
+    pub fn get_init_wait(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        self.init_wait.clone()
+    }
+
+    pub fn wait(cond_wait: Arc<(Mutex<bool>, Condvar)>) -> NimbleResult<()> {
+        let (lock, cvar) = &*cond_wait;
+        let mut initialized = lock
+            .lock()
+            .map_err(|e| VirtioNimbleError::BackendLock { error: e.to_string() })?;
+        while !*initialized {
+            initialized = cvar.wait(initialized).unwrap();
+        }
+        Ok(())
+    }
+
     pub fn initialized(&self) -> bool {
-        self.region_addr.is_some()
+        let (lock, _) = &*self.init_wait;
+        let initialized = lock.lock().unwrap();
+        *initialized
     }
 
     pub fn init(&mut self, gpa: GuestAddress) -> NimbleResult<()> {
@@ -261,6 +281,14 @@ impl ShmemManager {
             return Err(VirtioNimbleError::RegionSizeInvalid(region.len(), self.size));
         }
         self.region_addr.replace(gpa);
+
+        // Notify the waiting threads
+        let (lock, cvar) = &*self.init_wait;
+        let mut initialized = lock
+            .lock()
+            .map_err(|e| VirtioNimbleError::BackendLock { error: e.to_string() })?;
+        *initialized = true;
+        cvar.notify_all();
         Ok(())
     }
 }

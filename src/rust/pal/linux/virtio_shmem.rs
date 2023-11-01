@@ -70,6 +70,11 @@ impl SharedMemory {
                     VirtioNimbleRunner::new(Config::shmem_size(), 1, 2, Config::shmem_socket(), false).unwrap();
                 let host_manager: Arc<RwLock<VhostUserNimbleNetBackend>> = runner.get_host_mem_manager();
                 let shm_manager: Arc<Mutex<ShmemManager>> = host_manager.read().unwrap().get_shmem_manager();
+                // \TODO there are many locks hold up to this point, check that this will not dead-lock
+                // Get condition wait
+                let cond_wait = shm_manager.lock().unwrap().get_init_wait();
+                ShmemManager::wait(cond_wait).unwrap();
+                // Finally replace the mem_manager with the shm_manager, once it is initialized
                 mem_manager.replace(shm_manager);
                 VIRTIO_RUNNER.lock().unwrap().replace(runner);
             } else {
