@@ -5,12 +5,12 @@
 // Exports
 //======================================================================================================================
 
-#[cfg(all(feature = "catmem-libos", not(feature = "vm-shmem")))]
+#[cfg(all(feature = "catmem-libos", not(feature = "virtio-shmem")))]
 pub mod shm;
-#[cfg(all(feature = "catmem-libos", feature = "vm-shmem"))]
-pub mod vm_shmem;
-#[cfg(all(feature = "catmem-libos", feature = "vm-shmem"))]
-pub mod vm_shmem_lib;
+#[cfg(all(feature = "catmem-libos", feature = "virtio-shmem"))]
+pub mod virtio_shmem;
+#[cfg(all(feature = "catmem-libos", feature = "virtio-shmem"))]
+pub mod virtio_shmem_lib;
 
 //======================================================================================================================
 // Imports

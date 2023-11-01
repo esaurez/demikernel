@@ -43,11 +43,22 @@ slab = "0.4.9"
 socket2 = "0.5.4"
 yaml-rust = "0.4.5"
 x86 = "0.52.0"
-zerocopy = "0.7.10"
-zerocopy-derive = "0.7.10"
 # Demikernel Organization
 liburing = { git = "https://github.com/demikernel/liburing-rs", rev = "780827ee3f805d94f9909bd47cd925ee8476a64b", optional = true }
 dpdk-rs = { git = "https://github.com/demikernel/dpdk-rs", rev = "5a339766b6f64c2b09c2e4089c62013bfb48297e", optional = true }
+
+# Virtio dependencies
+argh = "0.1.9"
+env_logger = "0.10.0"
+epoll = "4.3.1"
+thiserror = "1.0.39"
+virtio-bindings = "0.2.0"
+vmm-sys-util = "0.11.0"
+## Versions are old and chosen to match cloud-hypervisor latest release
+vhost = { version = "0.6.0", features = ["vhost-user-slave"] }
+vhost-user-backend = "0.8.0"
+virtio-queue = "0.7.1"
+vm-memory = { version = "0.10.0", features = ["backend-mmap", "backend-atomic", "backend-bitmap"] }
 
 # Windows-specific dependencies.
 [target.'cfg(windows)'.dependencies]
@@ -155,7 +166,7 @@ libdpdk = ["dpdk-rs"]
 mlx4 = ["dpdk-rs/mlx4"]
 mlx5 = ["dpdk-rs/mlx5"]
 profiler = []
-vm-shmem = []
+virtio-shmem = []
 
 #=======================================================================================================================
 # Profile

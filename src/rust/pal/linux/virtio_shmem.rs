@@ -7,12 +7,18 @@
 // Imports
 //======================================================================================================================
 
-use crate::runtime::fail::Fail;
-use crate::pal::linux::vm_shmem_lib::{
-    base::{Region, IvshmemManager, RegionLocation},
-    guest::CharDevice,
-    host::SharedMemSegment,
-    config::Config,
+use crate::{
+    pal::linux::virtio_shmem_lib::{
+        base::{
+            RegionLocation,
+            RegionManager,
+            RegionTrait,
+        },
+        config::Config,
+        guest::CharDevice,
+        host::VirtioNimbleRunner,
+    },
+    runtime::fail::Fail,
 };
 
 use ::core::ops::{
@@ -20,19 +26,30 @@ use ::core::ops::{
     DerefMut,
 };
 use lazy_static::lazy_static;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc,
+    Mutex,
+    RwLock,
+};
 
+use crate::pal::linux::virtio_shmem_lib::host::{
+    ShmemManager,
+    VhostUserNimbleNetBackend,
+};
 
 lazy_static! {
-    static ref MEM_MANAGER: Arc<Mutex<Option<Box<dyn IvshmemManager>>>> = Arc::new(Mutex::new(Option::None));
+    static ref MEM_MANAGER: Arc<Mutex<Option<Arc<Mutex<dyn RegionManager>>>>> = Arc::new(Mutex::new(Option::None));
+    static ref VIRTIO_RUNNER: Arc<Mutex<Option<VirtioNimbleRunner>>> = Arc::new(Mutex::new(Option::None));
 }
 //======================================================================================================================
 // Structures
 //======================================================================================================================
 
+type RegionBox = Box<dyn RegionTrait<Target = [u8]>>;
+
 /// A named shared memory region.
 pub struct SharedMemory {
-	region: Region,
+    region: RegionBox,
 }
 
 //======================================================================================================================
@@ -49,9 +66,14 @@ impl SharedMemory {
         if mem_manager.is_none() {
             if Config::is_host() {
                 // The host runs directly on the shared memory segment, and handles it setup and management.
-                mem_manager.replace(Box::new(SharedMemSegment::open(&Config::shmem_path(), true).unwrap()));
+                let runner: VirtioNimbleRunner =
+                    VirtioNimbleRunner::new(Config::shmem_size(), 1, 2, Config::shmem_socket(), false).unwrap();
+                let host_manager: Arc<RwLock<VhostUserNimbleNetBackend>> = runner.get_host_mem_manager();
+                let shm_manager: Arc<Mutex<ShmemManager>> = host_manager.read().unwrap().get_shmem_manager();
+                mem_manager.replace(shm_manager);
+                VIRTIO_RUNNER.lock().unwrap().replace(runner);
             } else {
-                mem_manager.replace(Box::new(CharDevice::new()));
+                mem_manager.replace(Arc::new(Mutex::new(CharDevice::new())));
             }
         }
     }
@@ -59,14 +81,17 @@ impl SharedMemory {
     /// Opens an existing named shared memory region.
     pub fn open(name: &str, _len: usize) -> Result<SharedMemory, Fail> {
         Self::initialize_static_mem_manager();
-        let mut mem_manager = MEM_MANAGER.lock().unwrap();
+        let mut mem_lock = MEM_MANAGER.lock().map_err(|e| Fail {
+            errno: 0,
+            cause: e.to_string(),
+        })?;
+        let mut mem_manager = mem_lock.as_mut().unwrap().lock().unwrap();
         let name: String = Self::build_name(name)?;
-        let region_location: RegionLocation = 
-            match mem_manager.as_mut().unwrap().get_region(&name) {
-                Ok(region_location) => region_location,
-                Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to get region: {:?}", e))),
-            };
-        let region: Region = match mem_manager.as_mut().unwrap().mmap_region(&region_location) {
+        let region_location: RegionLocation = match mem_manager.get_region(&name) {
+            Ok(region_location) => region_location,
+            Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to get region: {:?}", e))),
+        };
+        let region: RegionBox = match mem_manager.mmap_region(&region_location) {
             Ok(region) => region,
             Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to mmap region: {:?}", e))),
         };
@@ -76,14 +101,17 @@ impl SharedMemory {
     /// Creates a named shared memory region.
     pub fn create(name: &str, size: usize) -> Result<SharedMemory, Fail> {
         Self::initialize_static_mem_manager();
-        let mut mem_manager = MEM_MANAGER.lock().unwrap();
+        let mut mem_lock = MEM_MANAGER.lock().map_err(|e| Fail {
+            errno: 0,
+            cause: e.to_string(),
+        })?;
+        let mut mem_manager = mem_lock.as_mut().unwrap().lock().unwrap();
         let name: String = Self::build_name(name)?;
-        let region_location: RegionLocation = 
-            match mem_manager.as_mut().unwrap().create_region(&name, size as u64) {
-                Ok(region_location) => region_location,
-                Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to get region: {:?}", e))),
-            };
-        let region: Region = match mem_manager.as_mut().unwrap().mmap_region(&region_location) {
+        let region_location: RegionLocation = match mem_manager.create_region(&name, size as u64) {
+            Ok(region_location) => region_location,
+            Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to get region: {:?}", e))),
+        };
+        let region: RegionBox = match mem_manager.mmap_region(&region_location) {
             Ok(region) => region,
             Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to mmap region: {:?}", e))),
         };
@@ -98,9 +126,6 @@ impl SharedMemory {
         let prefix: String = String::from(Self::SHM_NAME_PREFIX);
         Ok((prefix + name).to_string())
     }
-
-
-
 }
 
 //======================================================================================================================
@@ -112,14 +137,13 @@ impl Deref for SharedMemory {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &self.region[..self.region.size]
+        &self.region
     }
 }
 
 /// Mutable dereference trait implementation.
 impl DerefMut for SharedMemory {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let size: usize = self.region.size;
-        &mut self.region[..size]
+        &mut self.region
     }
 }

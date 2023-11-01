@@ -3,14 +3,14 @@
 
 use super::protocol::Icmpv4Type2;
 use crate::{
+    inetstack::protocols::{
+        compute_generic_checksum,
+        fold16,
+    },
     runtime::{
         fail::Fail,
         memory::DemiBuffer,
     },
-    inetstack::protocols::{
-        fold16,
-        compute_generic_checksum,
-    }
 };
 use ::libc::EBADMSG;
 use ::std::convert::TryInto;

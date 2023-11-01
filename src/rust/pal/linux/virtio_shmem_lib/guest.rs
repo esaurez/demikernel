@@ -1,18 +1,24 @@
-use crate::pal::linux::vm_shmem_lib::base::{
-    IvshmemError,
-    IvshmemManager,
-    Region,
+use crate::pal::linux::virtio_shmem_lib::base::{
+    NimbleResult,
     RegionLocation,
+    RegionManager,
+    RegionTrait,
+    VirtioNimbleError,
 };
 
 use std::{
     collections::HashMap,
     ffi::CString,
     fs::OpenOptions,
+    ops::{
+        Deref,
+        DerefMut,
+    },
     os::{
         raw::c_char,
         unix::io::AsRawFd,
     },
+    slice,
 };
 
 const DEVICE_PATH: &str = "/dev/demikernel_ivshmem_dev";
@@ -57,6 +63,34 @@ ioctl_read!(get_vm_id, IOCTL_MAGIC_NUMBER, SHVM_VM_ID, VmId);
 ioctl_readwrite!(create_region, IOCTL_MAGIC_NUMBER, SHVM_CREATE_REGION, CreateRegion);
 ioctl_readwrite!(get_region, IOCTL_MAGIC_NUMBER, SHVM_GET_REGION, GetRegion);
 
+pub struct Region {
+    /// Base address.
+    pub addr: *mut libc::c_void,
+    /// Size in bytes.
+    pub size: libc::size_t,
+    //\TODO Region should share the same lifetime as SharedMemSegment
+}
+
+impl Deref for Region {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        let data: *const u8 = self.addr as *const u8;
+        let len: usize = self.size;
+        unsafe { slice::from_raw_parts(data, len) }
+    }
+}
+
+impl DerefMut for Region {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let data: *mut u8 = self.addr as *mut u8;
+        let len: usize = self.size;
+        unsafe { slice::from_raw_parts_mut(data, len) }
+    }
+}
+
+impl RegionTrait for Region {}
+
 pub struct CharDevice {
     file: std::fs::File,
     region_dict: HashMap<u64, (*mut libc::c_void, usize)>,
@@ -64,6 +98,7 @@ pub struct CharDevice {
 
 // \TODO check that this is actually safe
 unsafe impl Send for CharDevice {}
+unsafe impl Sync for CharDevice {}
 
 impl CharDevice {
     pub fn new() -> CharDevice {
@@ -79,7 +114,7 @@ impl CharDevice {
     }
 
     #[allow(unused)]
-    pub fn get_vm_id(&self) -> Result<u32, IvshmemError> {
+    pub fn get_vm_id(&self) -> Result<u32, VirtioNimbleError> {
         let mut vm_id_struct = VmId { vm_id: 0 };
 
         match unsafe { get_vm_id(self.file.as_raw_fd() as _, &mut vm_id_struct) } {
@@ -89,17 +124,17 @@ impl CharDevice {
             },
             Err(_) => {
                 eprintln!("Ioctl operation failed");
-                Err(IvshmemError::IoctlFailed)
+                Err(VirtioNimbleError::IoctlFailed)
             },
         }
     }
 }
 
-impl IvshmemManager for CharDevice {
-    fn create_region(&mut self, region_name: &str, region_size: u64) -> Result<RegionLocation, IvshmemError> {
+impl RegionManager for CharDevice {
+    fn create_region(&mut self, region_name: &str, region_size: u64) -> Result<RegionLocation, VirtioNimbleError> {
         if region_size % 4096 != 0 {
             eprintln!("Region size must be a multiple of a page");
-            return Err(IvshmemError::IoctlFailed);
+            return Err(VirtioNimbleError::IoctlFailed);
         }
 
         let region_name = CString::new(region_name).expect("CString::new failed");
@@ -120,12 +155,12 @@ impl IvshmemManager for CharDevice {
             },
             Err(_) => {
                 eprintln!("Ioctl operation failed");
-                Err(IvshmemError::IoctlFailed)
+                Err(VirtioNimbleError::IoctlFailed)
             },
         }
     }
 
-    fn get_region(&mut self, region_name: &str) -> Result<RegionLocation, IvshmemError> {
+    fn get_region(&mut self, region_name: &str) -> Result<RegionLocation, VirtioNimbleError> {
         let region_name = CString::new(region_name).expect("CString::new failed");
         let mut get_region_struct = GetRegion {
             region_name: region_name.as_ptr(),
@@ -143,7 +178,7 @@ impl IvshmemManager for CharDevice {
                 // Check if the size is multiple of a page
                 if get_region_struct.region_size % 4096 != 0 {
                     eprintln!("Invalid region: region size must be a multiple of a page");
-                    return Err(IvshmemError::IoctlFailed);
+                    return Err(VirtioNimbleError::IoctlFailed);
                 }
                 Ok(RegionLocation {
                     offset: get_region_struct.region_offset,
@@ -152,12 +187,12 @@ impl IvshmemManager for CharDevice {
             },
             Err(_) => {
                 eprintln!("Ioctl operation failed");
-                Err(IvshmemError::IoctlFailed)
+                Err(VirtioNimbleError::IoctlFailed)
             },
         }
     }
 
-    fn mmap_region(&mut self, region_location: &RegionLocation) -> Result<Region, IvshmemError> {
+    fn mmap_region(&mut self, region_location: &RegionLocation) -> NimbleResult<Box<dyn RegionTrait<Target = [u8]>>> {
         let mmap_ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -172,14 +207,14 @@ impl IvshmemManager for CharDevice {
 
         if mmap_ptr == libc::MAP_FAILED {
             eprintln!("Failed to mmap region");
-            Err(IvshmemError::IoctlFailed)
+            Err(VirtioNimbleError::IoctlFailed)
         } else {
             self.region_dict
                 .insert(region_location.offset, (mmap_ptr, region_location.size as usize));
-            Ok(Region {
+            Ok(Box::new(Region {
                 addr: mmap_ptr,
                 size: region_location.size as usize,
-            })
+            }))
         }
     }
 }

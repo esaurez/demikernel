@@ -51,7 +51,6 @@ mod catcollar;
 #[cfg(all(feature = "catnap-libos"))]
 mod catnap;
 
-
 #[cfg(feature = "catmem-libos")]
 mod catmem;
 

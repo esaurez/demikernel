@@ -193,8 +193,7 @@ impl Application {
                 demi_opcode_t::DEMI_OPC_POP => {
                     let sockqd: QDesc = qr.qr_qd.into();
                     let sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
-                    let saddr: SocketAddr = match Self::sockaddr_to_socketaddrv4(&unsafe { qr.qr_value.sga.sga_addr })
-                    {
+                    let saddr: SocketAddr = match Self::sockaddr_to_socketaddrv4(&unsafe { qr.qr_value.sga.sga_addr }) {
                         Ok(saddr) => SocketAddr::V4(saddr),
                         Err(e) => {
                             // If error, free scatter-gather array.
