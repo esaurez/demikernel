@@ -472,7 +472,7 @@ impl SharedCatnapLibOS {
         }
     }
 
-    pub fn poll(&self) {
+    pub fn poll(&mut self) {
         #[cfg(feature = "profiler")]
         timer!("catnap::poll");
         self.runtime.poll()

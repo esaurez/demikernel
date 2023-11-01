@@ -1,14 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//======================================================================================================================
+// Imports
+//======================================================================================================================
+
 use super::{
     constants::FALLBACK_MSS,
-    established::ControlBlock,
+    established::SharedControlBlock,
     isn_generator::IsnGenerator,
 };
 use crate::{
+    collections::async_queue::AsyncQueue,
     inetstack::protocols::{
-        arp::ArpPeer,
+        arp::SharedArpPeer,
         ethernet2::{
             EtherType2,
             Ethernet2Header,
@@ -35,12 +40,14 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
-        queue::BackgroundTask,
-        timer::TimerRc,
+        timer::SharedTimer,
+        SharedBox,
+        SharedDemiRuntime,
+        SharedObject,
     },
     scheduler::{
-        Scheduler,
         TaskHandle,
+        Yielder,
     },
 };
 use ::libc::{
@@ -48,23 +55,23 @@ use ::libc::{
     ETIMEDOUT,
 };
 use ::std::{
-    cell::RefCell,
     collections::{
         HashMap,
         HashSet,
-        VecDeque,
     },
     convert::TryInto,
-    future::Future,
     net::SocketAddrV4,
-    rc::Rc,
-    task::{
-        Context,
-        Poll,
-        Waker,
+    ops::{
+        Deref,
+        DerefMut,
     },
     time::Duration,
 };
+use core::panic;
+
+//======================================================================================================================
+// Structures
+//======================================================================================================================
 
 struct InflightAccept {
     local_isn: SeqNumber,
@@ -72,45 +79,31 @@ struct InflightAccept {
     header_window_size: u16,
     remote_window_scale: Option<u8>,
     mss: usize,
-
-    #[allow(unused)]
     handle: TaskHandle,
 }
 
+#[derive(Default)]
 struct ReadySockets<const N: usize> {
-    ready: VecDeque<Result<ControlBlock<N>, Fail>>,
+    ready: AsyncQueue<Result<SharedControlBlock<N>, Fail>>,
     endpoints: HashSet<SocketAddrV4>,
-    waker: Option<Waker>,
 }
 
 impl<const N: usize> ReadySockets<N> {
-    fn push_ok(&mut self, cb: ControlBlock<N>) {
+    fn push_ok(&mut self, cb: SharedControlBlock<N>) {
         assert!(self.endpoints.insert(cb.get_remote()));
-        self.ready.push_back(Ok(cb));
-        if let Some(w) = self.waker.take() {
-            w.wake()
-        }
+        self.ready.push(Ok(cb))
     }
 
     fn push_err(&mut self, err: Fail) {
-        self.ready.push_back(Err(err));
-        if let Some(w) = self.waker.take() {
-            w.wake()
-        }
+        self.ready.push(Err(err));
     }
 
-    fn poll(&mut self, ctx: &mut Context) -> Poll<Result<ControlBlock<N>, Fail>> {
-        let r = match self.ready.pop_front() {
-            Some(r) => r,
-            None => {
-                self.waker.replace(ctx.waker().clone());
-                return Poll::Pending;
-            },
-        };
-        if let Ok(ref cb) = r {
+    async fn pop(&mut self, yielder: Yielder) -> Result<SharedControlBlock<N>, Fail> {
+        let result: Result<SharedControlBlock<N>, Fail> = self.ready.pop(yielder).await?;
+        if let Ok(ref cb) = result {
             assert!(self.endpoints.remove(&cb.get_remote()));
         }
-        Poll::Ready(r)
+        result
     }
 
     fn len(&self) -> usize {
@@ -120,51 +113,50 @@ impl<const N: usize> ReadySockets<N> {
 
 pub struct PassiveSocket<const N: usize> {
     inflight: HashMap<SocketAddrV4, InflightAccept>,
-    ready: Rc<RefCell<ReadySockets<N>>>,
-
+    ready: ReadySockets<N>,
     max_backlog: usize,
     isn_generator: IsnGenerator,
-
     local: SocketAddrV4,
-    rt: Rc<dyn NetworkRuntime<N>>,
-    scheduler: Scheduler,
-    clock: TimerRc,
+    runtime: SharedDemiRuntime,
+    transport: SharedBox<dyn NetworkRuntime<N>>,
+    clock: SharedTimer,
     tcp_config: TcpConfig,
     local_link_addr: MacAddress,
-    arp: ArpPeer<N>,
+    arp: SharedArpPeer<N>,
 }
 
-impl<const N: usize> PassiveSocket<N> {
+#[derive(Clone)]
+pub struct SharedPassiveSocket<const N: usize>(SharedObject<PassiveSocket<N>>);
+
+//======================================================================================================================
+// Associated Function
+//======================================================================================================================
+
+impl<const N: usize> SharedPassiveSocket<N> {
     pub fn new(
         local: SocketAddrV4,
         max_backlog: usize,
-        rt: Rc<dyn NetworkRuntime<N>>,
-        scheduler: Scheduler,
-        clock: TimerRc,
+        runtime: SharedDemiRuntime,
+        transport: SharedBox<dyn NetworkRuntime<N>>,
+        clock: SharedTimer,
         tcp_config: TcpConfig,
         local_link_addr: MacAddress,
-        arp: ArpPeer<N>,
+        arp: SharedArpPeer<N>,
         nonce: u32,
     ) -> Self {
-        let ready = ReadySockets {
-            ready: VecDeque::new(),
-            endpoints: HashSet::new(),
-            waker: None,
-        };
-        let ready = Rc::new(RefCell::new(ready));
-        Self {
+        Self(SharedObject::<PassiveSocket<N>>::new(PassiveSocket::<N> {
             inflight: HashMap::new(),
-            ready,
+            ready: ReadySockets::<N>::default(),
             max_backlog,
             isn_generator: IsnGenerator::new(nonce),
             local,
             local_link_addr,
-            rt,
-            scheduler,
+            runtime,
+            transport,
             clock,
             tcp_config,
             arp,
-        }
+        }))
     }
 
     /// Returns the address that the socket is bound to.
@@ -172,13 +164,13 @@ impl<const N: usize> PassiveSocket<N> {
         self.local
     }
 
-    pub fn poll_accept(&mut self, ctx: &mut Context) -> Poll<Result<ControlBlock<N>, Fail>> {
-        self.ready.borrow_mut().poll(ctx)
+    pub async fn accept(&mut self, yielder: Yielder) -> Result<SharedControlBlock<N>, Fail> {
+        self.ready.pop(yielder).await
     }
 
     pub fn receive(&mut self, ip_header: &Ipv4Header, header: &TcpHeader) -> Result<(), Fail> {
         let remote = SocketAddrV4::new(ip_header.get_src_addr(), header.src_port);
-        if self.ready.borrow().endpoints.contains(&remote) {
+        if self.ready.endpoints.contains(&remote) {
             // TODO: What should we do if a packet shows up for a connection that hasn't been `accept`ed yet?
             return Ok(());
         }
@@ -223,15 +215,17 @@ impl<const N: usize> PassiveSocket<N> {
                 local_window_scale, remote_window_scale
             );
 
-            if let Some(mut inflight) = self.inflight.remove(&remote) {
-                inflight.handle.deschedule();
+            if let Some(inflight) = self.inflight.remove(&remote) {
+                if let Err(e) = self.runtime.remove_background_coroutine(&inflight.handle) {
+                    panic!("Failed to remove inflight accept (error={:?})", e);
+                }
             }
 
-            let cb = ControlBlock::new(
+            let cb = SharedControlBlock::new(
                 self.local,
                 remote,
-                self.rt.clone(),
-                self.scheduler.clone(),
+                self.runtime.clone(),
+                self.transport.clone(),
                 self.clock.clone(),
                 self.local_link_addr,
                 self.tcp_config.clone(),
@@ -247,7 +241,7 @@ impl<const N: usize> PassiveSocket<N> {
                 congestion_control::None::new,
                 None,
             );
-            self.ready.borrow_mut().push_ok(cb);
+            self.ready.push_ok(cb);
             return Ok(());
         }
 
@@ -256,38 +250,23 @@ impl<const N: usize> PassiveSocket<N> {
             return Err(Fail::new(EBADMSG, "invalid flags"));
         }
         debug!("Received SYN: {:?}", header);
-        if inflight_len + self.ready.borrow().len() >= self.max_backlog {
+        if inflight_len + self.ready.len() >= self.max_backlog {
             let cause: String = format!(
                 "backlog full (inflight={}, ready={}, backlog={})",
                 inflight_len,
-                self.ready.borrow().len(),
+                self.ready.len(),
                 self.max_backlog
             );
             error!("receive(): {:?}", &cause);
             return Err(Fail::new(libc::ECONNREFUSED, &cause));
         }
-        let local_isn = self.isn_generator.generate(&self.local, &remote);
+        let local: SocketAddrV4 = self.local.clone();
+        let local_isn = self.isn_generator.generate(&local, &remote);
         let remote_isn = header.seq_num;
-        let future = Self::background(
-            local_isn,
-            remote_isn,
-            self.local,
-            remote,
-            self.rt.clone(),
-            self.clock.clone(),
-            self.tcp_config.clone(),
-            self.local_link_addr,
-            self.arp.clone(),
-            self.ready.clone(),
-        );
-        let task: BackgroundTask = BackgroundTask::new(
-            String::from("Inetstack::TCP::passiveopen::background"),
-            Box::pin(future),
-        );
-        let handle: TaskHandle = match self.scheduler.insert(task) {
-            Some(handle) => handle,
-            None => panic!("failed to insert task in the scheduler"),
-        };
+        let future = self.clone().background(remote, remote_isn, local_isn);
+        let handle: TaskHandle = self
+            .runtime
+            .insert_background_coroutine("Inetstack::TCP::passiveopen::background", Box::pin(future))?;
 
         let mut remote_window_scale = None;
         let mut mss = FALLBACK_MSS;
@@ -316,56 +295,66 @@ impl<const N: usize> PassiveSocket<N> {
         Ok(())
     }
 
-    fn background(
-        local_isn: SeqNumber,
-        remote_isn: SeqNumber,
-        local: SocketAddrV4,
-        remote: SocketAddrV4,
-        rt: Rc<dyn NetworkRuntime<N>>,
-        clock: TimerRc,
-        tcp_config: TcpConfig,
-        local_link_addr: MacAddress,
-        arp: ArpPeer<N>,
-        ready: Rc<RefCell<ReadySockets<N>>>,
-    ) -> impl Future<Output = ()> {
-        let handshake_retries: usize = tcp_config.get_handshake_retries();
-        let handshake_timeout: Duration = tcp_config.get_handshake_timeout();
+    async fn background(mut self, remote: SocketAddrV4, remote_isn: SeqNumber, local_isn: SeqNumber) {
+        let handshake_retries: usize = self.tcp_config.get_handshake_retries();
+        let handshake_timeout: Duration = self.tcp_config.get_handshake_timeout();
 
-        async move {
-            for _ in 0..handshake_retries {
-                let remote_link_addr = match arp.query(remote.ip().clone()).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!("ARP query failed: {:?}", e);
-                        continue;
-                    },
-                };
-                let mut tcp_hdr = TcpHeader::new(local.port(), remote.port());
-                tcp_hdr.syn = true;
-                tcp_hdr.seq_num = local_isn;
-                tcp_hdr.ack = true;
-                tcp_hdr.ack_num = remote_isn + SeqNumber::from(1);
-                tcp_hdr.window_size = tcp_config.get_receive_window_size();
+        for _ in 0..handshake_retries {
+            let remote_link_addr = match self.arp.query(remote.ip().clone()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("ARP query failed: {:?}", e);
+                    continue;
+                },
+            };
+            let mut tcp_hdr = TcpHeader::new(self.local.port(), remote.port());
+            tcp_hdr.syn = true;
+            tcp_hdr.seq_num = local_isn;
+            tcp_hdr.ack = true;
+            tcp_hdr.ack_num = remote_isn + SeqNumber::from(1);
+            tcp_hdr.window_size = self.tcp_config.get_receive_window_size();
 
-                let mss = tcp_config.get_advertised_mss() as u16;
-                tcp_hdr.push_option(TcpOptions2::MaximumSegmentSize(mss));
-                info!("Advertising MSS: {}", mss);
+            let mss = self.tcp_config.get_advertised_mss() as u16;
+            tcp_hdr.push_option(TcpOptions2::MaximumSegmentSize(mss));
+            info!("Advertising MSS: {}", mss);
 
-                tcp_hdr.push_option(TcpOptions2::WindowScale(tcp_config.get_window_scale()));
-                info!("Advertising window scale: {}", tcp_config.get_window_scale());
+            tcp_hdr.push_option(TcpOptions2::WindowScale(self.tcp_config.get_window_scale()));
+            info!("Advertising window scale: {}", self.tcp_config.get_window_scale());
 
-                debug!("Sending SYN+ACK: {:?}", tcp_hdr);
-                let segment = TcpSegment {
-                    ethernet2_hdr: Ethernet2Header::new(remote_link_addr, local_link_addr, EtherType2::Ipv4),
-                    ipv4_hdr: Ipv4Header::new(local.ip().clone(), remote.ip().clone(), IpProtocol::TCP),
-                    tcp_hdr,
-                    data: None,
-                    tx_checksum_offload: tcp_config.get_rx_checksum_offload(),
-                };
-                rt.transmit(Box::new(segment));
-                clock.wait(clock.clone(), handshake_timeout).await;
+            debug!("Sending SYN+ACK: {:?}", tcp_hdr);
+            let segment = TcpSegment {
+                ethernet2_hdr: Ethernet2Header::new(remote_link_addr, self.local_link_addr, EtherType2::Ipv4),
+                ipv4_hdr: Ipv4Header::new(self.local.ip().clone(), remote.ip().clone(), IpProtocol::TCP),
+                tcp_hdr,
+                data: None,
+                tx_checksum_offload: self.tcp_config.get_rx_checksum_offload(),
+            };
+            self.transport.transmit(Box::new(segment));
+            let clock_ref: SharedTimer = self.clock.clone();
+            let yielder: Yielder = Yielder::new();
+            if let Err(e) = clock_ref.wait(handshake_timeout, yielder).await {
+                self.ready.push_err(e);
+                return;
             }
-            ready.borrow_mut().push_err(Fail::new(ETIMEDOUT, "handshake timeout"));
         }
+        self.ready.push_err(Fail::new(ETIMEDOUT, "handshake timeout"));
+    }
+}
+
+//======================================================================================================================
+// Trait Implementations
+//======================================================================================================================
+
+impl<const N: usize> Deref for SharedPassiveSocket<N> {
+    type Target = PassiveSocket<N>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<const N: usize> DerefMut for SharedPassiveSocket<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
     }
 }

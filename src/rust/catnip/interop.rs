@@ -2,17 +2,14 @@
 // Licensed under the MIT license.
 
 use crate::{
-    catnip::DPDKRuntime,
+    catnip::SharedDPDKRuntime,
     pal::{
         constants::AF_INET,
         data_structures::{
             SockAddr,
             SockAddrIn,
         },
-        functions::{
-            create_sin_addr,
-            create_sin_zero,
-        },
+        functions::create_sin_addr,
     },
     runtime::{
         memory::MemoryRuntime,
@@ -26,12 +23,9 @@ use crate::{
     },
     OperationResult,
 };
-use ::std::{
-    mem,
-    rc::Rc,
-};
+use ::std::mem;
 
-pub fn pack_result(rt: Rc<DPDKRuntime>, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
+pub fn pack_result(rt: &SharedDPDKRuntime, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
     match result {
         OperationResult::Connect => demi_qresult_t {
             qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
@@ -46,7 +40,7 @@ pub fn pack_result(rt: Rc<DPDKRuntime>, result: OperationResult, qd: QDesc, qt: 
                     sin_family: AF_INET,
                     sin_port: addr.port().into(),
                     sin_addr: create_sin_addr(&addr.ip().octets()),
-                    sin_zero: create_sin_zero(),
+                    sin_zero: [0; 8],
                 }
             };
             let qr_value: demi_qr_value_t = demi_qr_value_t {
@@ -78,7 +72,7 @@ pub fn pack_result(rt: Rc<DPDKRuntime>, result: OperationResult, qd: QDesc, qt: 
                             sin_family: AF_INET,
                             sin_port: endpoint.port().into(),
                             sin_addr: create_sin_addr(&endpoint.ip().octets()),
-                            sin_zero: create_sin_zero(),
+                            sin_zero: [0; 8],
                         }
                     };
                     sga.sga_addr = unsafe { mem::transmute::<SockAddrIn, SockAddr>(saddr) };

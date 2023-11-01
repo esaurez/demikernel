@@ -7,24 +7,14 @@
 
 use crate::{
     inetstack::protocols::{
-        arp::ArpPeer,
+        arp::SharedArpPeer,
         ethernet2::{
             EtherType2,
             Ethernet2Header,
         },
-        tcp::{
-            operations::{
-                AcceptFuture,
-                CloseFuture,
-                ConnectFuture,
-                PopFuture,
-                PushFuture,
-            },
-            queue::TcpQueue,
-        },
         udp::{
-            queue::UdpQueue,
-            UdpPopFuture,
+            queue::SharedUdpQueue,
+            SharedUdpPeer,
         },
         Peer,
     },
@@ -48,7 +38,6 @@ use crate::{
             NetworkRuntime,
         },
         queue::{
-            IoQueueTable,
             Operation,
             OperationResult,
             OperationTask,
@@ -56,23 +45,20 @@ use crate::{
             QToken,
             QType,
         },
-        timer::TimerRc,
+        timer::SharedTimer,
+        SharedBox,
+        SharedDemiRuntime,
     },
-    scheduler::{
-        Scheduler,
-        TaskHandle,
-    },
+    scheduler::TaskHandle,
 };
 use ::libc::c_int;
 use ::std::{
-    cell::RefCell,
     net::{
         Ipv4Addr,
         SocketAddr,
         SocketAddrV4,
     },
     pin::Pin,
-    rc::Rc,
     time::Instant,
 };
 
@@ -103,21 +89,20 @@ const MAX_RECV_ITERS: usize = 2;
 //======================================================================================================================
 
 pub struct InetStack<const N: usize> {
-    arp: ArpPeer<N>,
+    arp: SharedArpPeer<N>,
     ipv4: Peer<N>,
-    qtable: Rc<RefCell<IoQueueTable>>,
-    rt: Rc<dyn NetworkRuntime<N>>,
+    runtime: SharedDemiRuntime,
+    transport: SharedBox<dyn NetworkRuntime<N>>,
     local_link_addr: MacAddress,
-    scheduler: Scheduler,
-    clock: TimerRc,
+    clock: SharedTimer,
     ts_iters: usize,
 }
 
 impl<const N: usize> InetStack<N> {
     pub fn new(
-        rt: Rc<dyn NetworkRuntime<N>>,
-        scheduler: Scheduler,
-        clock: TimerRc,
+        runtime: SharedDemiRuntime,
+        transport: SharedBox<dyn NetworkRuntime<N>>,
+        clock: SharedTimer,
         local_link_addr: MacAddress,
         local_ipv4_addr: Ipv4Addr,
         udp_config: UdpConfig,
@@ -125,19 +110,17 @@ impl<const N: usize> InetStack<N> {
         rng_seed: [u8; 32],
         arp_config: ArpConfig,
     ) -> Result<Self, Fail> {
-        let qtable: Rc<RefCell<IoQueueTable>> = Rc::new(RefCell::new(IoQueueTable::new()));
-        let arp: ArpPeer<N> = ArpPeer::new(
-            rt.clone(),
-            scheduler.clone(),
+        let arp: SharedArpPeer<N> = SharedArpPeer::new(
+            runtime.clone(),
+            transport.clone(),
             clock.clone(),
             local_link_addr,
             local_ipv4_addr,
             arp_config,
         )?;
         let ipv4: Peer<N> = Peer::new(
-            rt.clone(),
-            scheduler.clone(),
-            qtable.clone(),
+            runtime.clone(),
+            transport.clone(),
             clock.clone(),
             local_link_addr,
             local_ipv4_addr,
@@ -149,10 +132,9 @@ impl<const N: usize> InetStack<N> {
         Ok(Self {
             arp,
             ipv4,
-            qtable,
-            rt,
+            runtime,
+            transport,
             local_link_addr,
-            scheduler,
             clock,
             ts_iters: 0,
         })
@@ -161,18 +143,6 @@ impl<const N: usize> InetStack<N> {
     //======================================================================================================================
     // Associated Functions
     //======================================================================================================================
-
-    ///
-    /// **Brief**
-    ///
-    /// Looks up queue type based on queue descriptor
-    ///
-    fn lookup_qtype(&self, &qd: &QDesc) -> Option<QType> {
-        match self.qtable.borrow().get_type(&qd) {
-            Ok(qtype) => Some(qtype),
-            Err(_) => None,
-        }
-    }
 
     ///
     /// **Brief**
@@ -206,8 +176,8 @@ impl<const N: usize> InetStack<N> {
             return Err(Fail::new(libc::ENOTSUP, "address family not supported"));
         }
         match socket_type {
-            SOCK_STREAM => self.ipv4.tcp.do_socket(),
-            SOCK_DGRAM => self.ipv4.udp.do_socket(),
+            SOCK_STREAM => self.ipv4.tcp.socket(),
+            SOCK_DGRAM => self.ipv4.udp.socket(),
             _ => Err(Fail::new(libc::ENOTSUP, "socket type not supported")),
         }
     }
@@ -231,11 +201,10 @@ impl<const N: usize> InetStack<N> {
         // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
         let local: SocketAddrV4 = unwrap_socketaddr(local)?;
 
-        match self.lookup_qtype(&qd) {
-            Some(QType::TcpSocket) => self.ipv4.tcp.bind(qd, local),
-            Some(QType::UdpSocket) => self.ipv4.udp.do_bind(qd, local),
-            Some(_) => Err(Fail::new(libc::EINVAL, "invalid queue type")),
-            None => Err(Fail::new(libc::EBADF, "bad queue descriptor")),
+        match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => self.ipv4.tcp.bind(qd, local),
+            QType::UdpSocket => self.ipv4.udp.bind(qd, local),
+            _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
         }
     }
 
@@ -265,10 +234,9 @@ impl<const N: usize> InetStack<N> {
             return Err(Fail::new(libc::EINVAL, "invalid backlog length"));
         }
 
-        match self.lookup_qtype(&qd) {
-            Some(QType::TcpSocket) => self.ipv4.tcp.listen(qd, backlog),
-            Some(_) => Err(Fail::new(libc::EINVAL, "invalid queue type")),
-            None => Err(Fail::new(libc::EBADF, "bad queue descriptor")),
+        match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => self.ipv4.tcp.listen(qd, backlog),
+            _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
         }
     }
 
@@ -290,41 +258,15 @@ impl<const N: usize> InetStack<N> {
         trace!("accept(): {:?}", qd);
 
         // Search for target queue descriptor.
-        match self.lookup_qtype(&qd) {
-            Some(QType::TcpSocket) => {
-                let (new_qd, future): (QDesc, AcceptFuture<N>) = self.ipv4.tcp.do_accept(qd);
-                let qtable_ptr: Rc<RefCell<IoQueueTable>> = self.qtable.clone();
-                let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                    // Wait for accept to complete.
-                    let result: Result<(QDesc, SocketAddrV4), Fail> = future.await;
-                    // Handle result: If unsuccessful, free the new queue descriptor.
-                    match result {
-                        Ok((_, addr)) => (qd, OperationResult::Accept((new_qd, addr))),
-                        Err(e) => {
-                            // It is safe to call expect here because we looked up the queue to schedule this coroutine
-                            // and no other accept coroutine should be able to run due to state machine checks.
-                            qtable_ptr
-                                .borrow_mut()
-                                .free::<TcpQueue<N>>(&new_qd)
-                                .expect("queue should have been allocated");
-                            (qd, OperationResult::Failed(e))
-                        },
-                    }
-                });
+        match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => {
+                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.accept(qd);
                 let task_id: String = format!("Inetstack::TCP::accept for qd={:?}", qd);
-                let task: OperationTask = OperationTask::new(task_id, coroutine);
-                let handle: TaskHandle = match self.scheduler.insert(task) {
-                    Some(handle) => handle,
-                    None => {
-                        return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine"));
-                    },
-                };
+                let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
                 Ok(handle.get_task_id().into())
             },
             // This queue descriptor does not concern a TCP socket.
-            Some(_) => Err(Fail::new(libc::EINVAL, "invalid queue type")),
-            // The queue descriptor was not found.
-            None => Err(Fail::new(libc::EBADF, "bad queue descriptor")),
+            _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
         }
     }
 
@@ -348,32 +290,15 @@ impl<const N: usize> InetStack<N> {
         // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
         let remote: SocketAddrV4 = unwrap_socketaddr(remote)?;
 
-        let task: OperationTask = match self.lookup_qtype(&qd) {
-            Some(QType::TcpSocket) => {
-                let future: ConnectFuture<N> = self.ipv4.tcp.connect(qd, remote)?;
-                let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                    // Wait for connect to complete.
-                    let result: Result<(), Fail> = future.await;
-                    // Handle result.
-                    match result {
-                        Ok(()) => (qd, OperationResult::Connect),
-                        Err(e) => (qd, OperationResult::Failed(e)),
-                    }
-                });
+        match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => {
+                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.connect(qd, remote);
                 let task_id: String = format!("Inetstack::TCP::connect for qd={:?}", qd);
-                OperationTask::new(task_id, coroutine)
+                let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
+                Ok(handle.get_task_id().into())
             },
-            Some(_) => return Err(Fail::new(libc::EINVAL, "invalid queue type")),
-            None => return Err(Fail::new(libc::EBADF, "bad queue descriptor")),
-        };
-
-        let handle: TaskHandle = match self.scheduler.insert(task) {
-            Some(handle) => handle,
-            None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-        };
-        let qt: QToken = handle.get_task_id().into();
-        trace!("connect() qt={:?}", qt);
-        Ok(qt)
+            _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
+        }
     }
 
     ///
@@ -391,11 +316,10 @@ impl<const N: usize> InetStack<N> {
         timer!("inetstack::close");
         trace!("close(): qd={:?}", qd);
 
-        match self.lookup_qtype(&qd) {
-            Some(QType::TcpSocket) => self.ipv4.tcp.do_close(qd),
-            Some(QType::UdpSocket) => self.ipv4.udp.do_close(qd),
-            Some(_) => Err(Fail::new(libc::EINVAL, "invalid queue type")),
-            None => Err(Fail::new(libc::EBADF, "bad queue descriptor")),
+        match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => self.ipv4.tcp.close(qd),
+            QType::UdpSocket => self.ipv4.udp.close(qd),
+            _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
         }
     }
 
@@ -414,50 +338,30 @@ impl<const N: usize> InetStack<N> {
         timer!("inetstack::async_close");
         trace!("async_close(): qd={:?}", qd);
 
-        let qtable_ptr: Rc<RefCell<IoQueueTable>> = self.qtable.clone();
-        let (task_id, coroutine): (String, Pin<Box<Operation>>) = match self.lookup_qtype(&qd) {
-            Some(QType::TcpSocket) => {
-                let future: CloseFuture<N> = self.ipv4.tcp.do_async_close(qd)?;
+        let (task_id, coroutine): (String, Pin<Box<Operation>>) = match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => {
                 let task_id: String = format!("Inetstack::TCP::close for qd={:?}", qd);
-                let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                    let result: Result<(), Fail> = future.await;
-                    match result {
-                        Ok(()) => {
-                            // Expect is safe here because we looked up the queue to schedule this coroutine and no
-                            // other close coroutine should be able to run due to state machine checks.
-                            qtable_ptr
-                                .borrow_mut()
-                                .free::<TcpQueue<N>>(&qd)
-                                .expect("queue should exist");
-                            (qd, OperationResult::Close)
-                        },
-                        Err(e) => (qd, OperationResult::Failed(e)),
-                    }
-                });
+                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.async_close(qd);
                 (task_id, coroutine)
             },
-            Some(QType::UdpSocket) => {
-                self.ipv4.udp.do_close(qd)?;
-                let task_id: String = format!("Inetstack::TCP::close for qd={:?}", qd);
+            QType::UdpSocket => {
+                self.ipv4.udp.close(qd)?;
+                let task_id: String = format!("Inetstack::UDP::close for qd={:?}", qd);
+                let mut runtime: SharedDemiRuntime = self.runtime.clone();
                 let coroutine: Pin<Box<Operation>> = Box::pin(async move {
                     // Expect is safe here because we looked up the queue to schedule this coroutine and no
                     // other close coroutine should be able to run due to state machine checks.
-                    qtable_ptr
-                        .borrow_mut()
-                        .free::<UdpQueue>(&qd)
+                    runtime
+                        .free_queue::<SharedUdpQueue<N>>(&qd)
                         .expect("queue should exist");
                     (qd, OperationResult::Close)
                 });
                 (task_id, coroutine)
             },
-            Some(_) => return Err(Fail::new(libc::EINVAL, "invalid queue type")),
-            None => return Err(Fail::new(libc::EBADF, "bad queue descriptor")),
+            _ => return Err(Fail::new(libc::EINVAL, "invalid queue type")),
         };
 
-        let handle: TaskHandle = match self.scheduler.insert(OperationTask::new(task_id, coroutine)) {
-            Some(handle) => handle,
-            None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-        };
+        let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
         let qt: QToken = handle.get_task_id().into();
         trace!("async_close() qt={:?}", qt);
         Ok(qt)
@@ -465,24 +369,14 @@ impl<const N: usize> InetStack<N> {
 
     /// Pushes a buffer to a TCP socket.
     /// TODO: Rename this function to push() once we have a common representation across all libOSes.
-    pub fn do_push(&mut self, qd: QDesc, buf: DemiBuffer) -> Result<OperationTask, Fail> {
-        match self.lookup_qtype(&qd) {
-            Some(QType::TcpSocket) => {
-                let future: PushFuture = self.ipv4.tcp.push(qd, buf);
-                let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                    // Wait for push to complete.
-                    let result: Result<(), Fail> = future.await;
-                    // Handle result.
-                    match result {
-                        Ok(()) => (qd, OperationResult::Push),
-                        Err(e) => (qd, OperationResult::Failed(e)),
-                    }
-                });
+    pub fn do_push(&mut self, qd: QDesc, buf: DemiBuffer) -> Result<TaskHandle, Fail> {
+        match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => {
+                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.push(qd, buf);
                 let task_id: String = format!("Inetstack::TCP::push for qd={:?}", qd);
-                Ok(OperationTask::new(task_id, coroutine))
+                self.runtime.insert_coroutine(task_id.as_str(), coroutine)
             },
-            Some(_) => Err(Fail::new(libc::EINVAL, "invalid queue type")),
-            None => Err(Fail::new(libc::EBADF, "bad queue descriptor")),
+            _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
         }
     }
 
@@ -500,11 +394,7 @@ impl<const N: usize> InetStack<N> {
         }
 
         // Issue operation.
-        let task: OperationTask = self.do_push(qd, buf)?;
-        let handle: TaskHandle = match self.scheduler.insert(task) {
-            Some(handle) => handle,
-            None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-        };
+        let handle: TaskHandle = self.do_push(qd, buf)?;
         let qt: QToken = handle.get_task_id().into();
         trace!("push2() qt={:?}", qt);
         Ok(qt)
@@ -512,19 +402,18 @@ impl<const N: usize> InetStack<N> {
 
     /// Pushes a buffer to a UDP socket.
     /// TODO: Rename this function to pushto() once we have a common buffer representation across all libOSes.
-    pub fn do_pushto(&mut self, qd: QDesc, buf: DemiBuffer, to: SocketAddr) -> Result<OperationTask, Fail> {
+    pub fn do_pushto(&mut self, qd: QDesc, buf: DemiBuffer, to: SocketAddr) -> Result<TaskHandle, Fail> {
         // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
         let to: SocketAddrV4 = unwrap_socketaddr(to)?;
 
-        match self.lookup_qtype(&qd) {
-            Some(QType::UdpSocket) => {
-                self.ipv4.udp.do_pushto(qd, buf, to)?;
+        match self.runtime.get_queue_type(&qd)? {
+            QType::UdpSocket => {
+                self.ipv4.udp.pushto(qd, buf, to)?;
                 let coroutine: Pin<Box<Operation>> = Box::pin(async move { (qd, OperationResult::Push) });
                 let task_id: String = format!("Inetstack::UDP::pushto for qd={:?}", qd);
-                Ok(OperationTask::new(task_id, coroutine))
+                self.runtime.insert_coroutine(task_id.as_str(), coroutine)
             },
-            Some(_) => Err(Fail::new(libc::EINVAL, "invalid queue type")),
-            None => Err(Fail::new(libc::EBADF, "bad queue descriptor")),
+            _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
         }
     }
 
@@ -540,12 +429,8 @@ impl<const N: usize> InetStack<N> {
         if buf.is_empty() {
             return Err(Fail::new(libc::EINVAL, "zero-length buffer"));
         }
-        let task: OperationTask = self.do_pushto(qd, buf, remote)?;
         // Issue operation.
-        let handle: TaskHandle = match self.scheduler.insert(task) {
-            Some(handle) => handle,
-            None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-        };
+        let handle: TaskHandle = self.do_pushto(qd, buf, remote)?;
         let qt: QToken = handle.get_task_id().into();
         trace!("pushto2() qt={:?}", qt);
         Ok(qt)
@@ -562,41 +447,22 @@ impl<const N: usize> InetStack<N> {
         // We just assert 'size' here, because it was previously checked at PDPIX layer.
         debug_assert!(size.is_none() || ((size.unwrap() > 0) && (size.unwrap() <= limits::POP_SIZE_MAX)));
 
-        let (task_id, coroutine): (String, Pin<Box<Operation>>) = match self.lookup_qtype(&qd) {
-            Some(QType::TcpSocket) => {
+        let (task_id, coroutine): (String, Pin<Box<Operation>>) = match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => {
                 let task_id: String = format!("Inetstack::TCP::pop for qd={:?}", qd);
-                let future: PopFuture<N> = self.ipv4.tcp.pop(qd, size);
-                let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                    // Wait for pop to complete.
-                    let result: Result<DemiBuffer, Fail> = future.await;
-                    // Handle result.
-                    match result {
-                        Ok(buf) => (qd, OperationResult::Pop(None, buf)),
-                        Err(e) => (qd, OperationResult::Failed(e)),
-                    }
-                });
+                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.pop(qd, size);
                 (task_id, coroutine)
             },
-            Some(QType::UdpSocket) => {
+            QType::UdpSocket => {
                 let task_id: String = format!("Inetstack::UDP::pop for qd={:?}", qd);
-                let future: UdpPopFuture = self.ipv4.udp.do_pop(qd, size);
-                let coroutine: Pin<Box<Operation>> = Box::pin(async move {
-                    let result: Result<(SocketAddrV4, DemiBuffer), Fail> = future.await;
-                    match result {
-                        Ok((addr, buf)) => (qd, OperationResult::Pop(Some(addr), buf)),
-                        Err(e) => (qd, OperationResult::Failed(e)),
-                    }
-                });
+                let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
+                let coroutine: Pin<Box<Operation>> = Box::pin(async move { udp.pop_coroutine(qd, size).await });
                 (task_id, coroutine)
             },
-            Some(_) => return Err(Fail::new(libc::EINVAL, "invalid queue type")),
-            None => return Err(Fail::new(libc::EBADF, "bad queue descriptor")),
+            _ => return Err(Fail::new(libc::EINVAL, "invalid queue type")),
         };
 
-        let handle: TaskHandle = match self.scheduler.insert(OperationTask::new(task_id, coroutine)) {
-            Some(handle) => handle,
-            None => return Err(Fail::new(libc::EAGAIN, "cannot schedule co-routine")),
-        };
+        let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
         let qt: QToken = handle.get_task_id().into();
         trace!("pop() qt={:?}", qt);
         Ok(qt)
@@ -611,10 +477,7 @@ impl<const N: usize> InetStack<N> {
         trace!("wait2(): qt={:?}", qt);
 
         // Retrieve associated schedule handle.
-        let handle: TaskHandle = match self.scheduler.from_task_id(qt.into()) {
-            Some(handle) => handle,
-            None => return Err(Fail::new(libc::EINVAL, "invalid queue token")),
-        };
+        let handle: TaskHandle = self.runtime.from_task_id(qt.into())?;
 
         loop {
             // Poll first, so as to give pending operations a chance to complete.
@@ -644,10 +507,7 @@ impl<const N: usize> InetStack<N> {
             for (i, &qt) in qts.iter().enumerate() {
                 // Retrieve associated schedule handle.
                 // TODO: move this out of the loop.
-                let handle: TaskHandle = match self.scheduler.from_task_id(qt.into()) {
-                    Some(handle) => handle,
-                    None => return Err(Fail::new(libc::EINVAL, "invalid queue token")),
-                };
+                let handle: TaskHandle = self.runtime.from_task_id(qt.into())?;
 
                 // Found one, so extract the result and return.
                 if handle.has_completed() {
@@ -663,12 +523,7 @@ impl<const N: usize> InetStack<N> {
     ///
     /// This function will panic if the specified future had not completed or is _background_ future.
     pub fn take_operation(&mut self, handle: TaskHandle) -> (QDesc, OperationResult) {
-        let task: OperationTask = if let Some(task) = self.scheduler.remove(&handle) {
-            OperationTask::from(task.as_any())
-        } else {
-            panic!("Removing task that does not exist (either was previously removed or never inserted)");
-        };
-
+        let task: OperationTask = self.runtime.remove_coroutine(&handle);
         task.get_result().expect("Coroutine not finished")
     }
 
@@ -702,7 +557,7 @@ impl<const N: usize> InetStack<N> {
         {
             #[cfg(feature = "profiler")]
             timer!("inetstack::poll_bg_work::poll");
-            self.scheduler.poll();
+            self.runtime.poll();
         }
 
         {
@@ -714,7 +569,7 @@ impl<const N: usize> InetStack<N> {
                     #[cfg(feature = "profiler")]
                     timer!("inetstack::poll_bg_work::for::receive");
 
-                    self.rt.receive()
+                    self.transport.receive()
                 };
 
                 {
@@ -730,7 +585,7 @@ impl<const N: usize> InetStack<N> {
                             warn!("Dropped packet: {:?}", e);
                         }
                         // TODO: This is a workaround for https://github.com/demikernel/inetstack/issues/149.
-                        self.scheduler.poll();
+                        self.runtime.poll();
                     }
                 }
             }

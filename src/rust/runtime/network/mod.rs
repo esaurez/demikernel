@@ -59,8 +59,8 @@ pub trait PacketBuf {
 /// Network Runtime
 pub trait NetworkRuntime<const N: usize> {
     /// Transmits a single [PacketBuf].
-    fn transmit(&self, pkt: Box<dyn PacketBuf>);
+    fn transmit(&mut self, pkt: Box<dyn PacketBuf>);
 
     /// Receives a batch of [DemiBuffer].
-    fn receive(&self) -> ArrayVec<DemiBuffer, N>;
+    fn receive(&mut self) -> ArrayVec<DemiBuffer, N>;
 }
