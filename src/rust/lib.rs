@@ -13,7 +13,7 @@
 #![cfg_attr(target_os = "windows", feature(maybe_uninit_uninit_array))]
 
 mod collections;
-mod pal;
+pub mod pal;
 
 #[cfg(feature = "profiler")]
 pub mod perftools;
