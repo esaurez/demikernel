@@ -21,7 +21,7 @@ use std::{
     slice,
 };
 
-const DEVICE_PATH: &str = "/dev/demikernel_ivshmem_dev";
+const DEVICE_PATH: &str = "/dev/virtio_nimblenet_dev";
 
 #[repr(C)]
 pub struct CreateRegion {
@@ -43,23 +43,14 @@ pub struct GetRegion {
     region_size: u64,
 }
 
-#[repr(C)]
-pub struct VmId {
-    // Response
-    vm_id: u32,
-}
-
 // The following is the equivalent of the following C code:
-// #define SHVM_VM_ID _IOR(SHVM_IOC_MAGIC, 1, char*)
 // #define SHVM_CREATE_REGION _IOWR(SHVM_IOC_MAGIC, 2, struct CreateRegion)
 // #define SHVM_GET_REGION _IOWR(SHVM_IOC_MAGIC, 3, struct GetRegion)
 
 // The magic  number used by the driver is lower-case s (0x73)
 const IOCTL_MAGIC_NUMBER: u8 = 's' as u8;
-const SHVM_VM_ID: u8 = 1;
-const SHVM_CREATE_REGION: u8 = 2;
-const SHVM_GET_REGION: u8 = 3;
-ioctl_read!(get_vm_id, IOCTL_MAGIC_NUMBER, SHVM_VM_ID, VmId);
+const SHVM_CREATE_REGION: u8 = 1;
+const SHVM_GET_REGION: u8 = 2;
 ioctl_readwrite!(create_region, IOCTL_MAGIC_NUMBER, SHVM_CREATE_REGION, CreateRegion);
 ioctl_readwrite!(get_region, IOCTL_MAGIC_NUMBER, SHVM_GET_REGION, GetRegion);
 
@@ -110,22 +101,6 @@ impl CharDevice {
         CharDevice {
             file: device_file,
             region_dict: HashMap::new(),
-        }
-    }
-
-    #[allow(unused)]
-    pub fn get_vm_id(&self) -> Result<u32, VirtioNimbleError> {
-        let mut vm_id_struct = VmId { vm_id: 0 };
-
-        match unsafe { get_vm_id(self.file.as_raw_fd() as _, &mut vm_id_struct) } {
-            Ok(_) => {
-                println!("VM ID: {}", vm_id_struct.vm_id);
-                Ok(vm_id_struct.vm_id)
-            },
-            Err(_) => {
-                eprintln!("Ioctl operation failed");
-                Err(VirtioNimbleError::IoctlFailed)
-            },
         }
     }
 }
