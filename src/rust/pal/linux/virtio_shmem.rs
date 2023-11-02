@@ -61,7 +61,7 @@ impl SharedMemory {
     /// Prefix for shared memory region names.
     const SHM_NAME_PREFIX: &'static str = "demikernel-";
 
-    fn initialize_static_mem_manager() {
+    pub fn initialize_static_mem_manager() {
         let mut mem_manager = MEM_MANAGER.lock().unwrap();
         if mem_manager.is_none() {
             if Config::is_host() {
