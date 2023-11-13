@@ -19,10 +19,7 @@ use crate::{
             EtherType2,
             Ethernet2Header,
         },
-        ip::{
-            EphemeralPorts,
-            IpProtocol,
-        },
+        ip::IpProtocol,
         ipv4::Ipv4Header,
         tcp::{
             established::SharedControlBlock,
@@ -38,10 +35,10 @@ use crate::{
         memory::DemiBuffer,
         network::{
             config::TcpConfig,
+            socket::SocketId,
             types::MacAddress,
             NetworkRuntime,
         },
-        timer::SharedTimer,
         Operation,
         OperationResult,
         QDesc,
@@ -59,7 +56,6 @@ use ::rand::{
 };
 
 use ::std::{
-    collections::HashMap,
     net::{
         Ipv4Addr,
         SocketAddrV4,
@@ -87,12 +83,6 @@ pub enum Socket<const N: usize> {
     Closing(EstablishedSocket<N>),
 }
 
-#[derive(PartialEq, Eq, Hash)]
-enum SocketId {
-    Active(SocketAddrV4, SocketAddrV4),
-    Passive(SocketAddrV4),
-}
-
 //======================================================================================================================
 // Structures
 //======================================================================================================================
@@ -100,11 +90,7 @@ enum SocketId {
 pub struct TcpPeer<const N: usize> {
     runtime: SharedDemiRuntime,
     isn_generator: IsnGenerator,
-    ephemeral_ports: EphemeralPorts,
-    // Connection or socket identifier for mapping incoming packets to the Demikernel queue
-    addresses: HashMap<SocketId, QDesc>,
     transport: SharedBox<dyn NetworkRuntime<N>>,
-    clock: SharedTimer,
     local_link_addr: MacAddress,
     local_ipv4_addr: Ipv4Addr,
     tcp_config: TcpConfig,
@@ -120,59 +106,30 @@ pub struct SharedTcpPeer<const N: usize>(SharedObject<TcpPeer<N>>);
 // Associated Functions
 //======================================================================================================================
 
-impl<const N: usize> TcpPeer<N> {
-    fn new(
-        runtime: SharedDemiRuntime,
-        transport: SharedBox<dyn NetworkRuntime<N>>,
-        clock: SharedTimer,
-        local_link_addr: MacAddress,
-        local_ipv4_addr: Ipv4Addr,
-        tcp_config: TcpConfig,
-        arp: SharedArpPeer<N>,
-        rng_seed: [u8; 32],
-    ) -> Self {
-        let mut rng: SmallRng = SmallRng::from_seed(rng_seed);
-        let ephemeral_ports: EphemeralPorts = EphemeralPorts::new(&mut rng);
-        let nonce: u32 = rng.gen();
-        let (tx, _) = mpsc::unbounded();
-        Self {
-            isn_generator: IsnGenerator::new(nonce),
-            ephemeral_ports,
-            runtime,
-            transport,
-            addresses: HashMap::<SocketId, QDesc>::new(),
-            clock,
-            local_link_addr,
-            local_ipv4_addr,
-            tcp_config,
-            arp,
-            rng,
-            dead_socket_tx: tx,
-        }
-    }
-}
-
 impl<const N: usize> SharedTcpPeer<N> {
     pub fn new(
         runtime: SharedDemiRuntime,
         transport: SharedBox<dyn NetworkRuntime<N>>,
-        clock: SharedTimer,
         local_link_addr: MacAddress,
         local_ipv4_addr: Ipv4Addr,
         tcp_config: TcpConfig,
         arp: SharedArpPeer<N>,
         rng_seed: [u8; 32],
     ) -> Result<Self, Fail> {
-        Ok(Self(SharedObject::<TcpPeer<N>>::new(TcpPeer::<N>::new(
+        let mut rng: SmallRng = SmallRng::from_seed(rng_seed);
+        let nonce: u32 = rng.gen();
+        let (tx, _) = mpsc::unbounded();
+        Ok(Self(SharedObject::<TcpPeer<N>>::new(TcpPeer::<N> {
+            isn_generator: IsnGenerator::new(nonce),
             runtime,
             transport,
-            clock,
             local_link_addr,
             local_ipv4_addr,
             tcp_config,
             arp,
-            rng_seed,
-        ))))
+            rng,
+            dead_socket_tx: tx,
+        })))
     }
 
     /// Opens a TCP socket.
@@ -205,16 +162,16 @@ impl<const N: usize> SharedTcpPeer<N> {
         // TODO: Check if we are binding to a non-local address.
 
         // Check wether the address is in use.
-        if self.addr_in_use(local) {
+        if self.runtime.addr_in_use(local) {
             let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
             error!("bind(): {}", &cause);
             return Err(Fail::new(libc::EADDRINUSE, &cause));
         }
 
         // Check if this is an ephemeral port.
-        if EphemeralPorts::is_private(local.port()) {
+        if SharedDemiRuntime::is_private_ephemeral_port(local.port()) {
             // Allocate ephemeral port from the pool, to leave  ephemeral port allocator in a consistent state.
-            self.ephemeral_ports.alloc_port(local.port())?
+            self.runtime.reserve_ephemeral_port(local.port())?
         }
 
         // Issue operation.
@@ -236,13 +193,13 @@ impl<const N: usize> SharedTcpPeer<N> {
         // Handle return value.
         match ret {
             Ok(x) => {
-                self.addresses.insert(SocketId::Passive(local), qd);
+                self.runtime.insert_socket_id_to_qd(SocketId::Passive(local), qd);
                 Ok(x)
             },
             Err(e) => {
                 // Rollback ephemeral port allocation.
-                if EphemeralPorts::is_private(local.port()) {
-                    if self.ephemeral_ports.free(local.port()).is_err() {
+                if SharedDemiRuntime::is_private_ephemeral_port(local.port()) {
+                    if self.runtime.free_ephemeral_port(local.port()).is_err() {
                         warn!("bind(): leaking ephemeral port (port={})", local.port());
                     }
                 }
@@ -260,8 +217,8 @@ impl<const N: usize> SharedTcpPeer<N> {
         match queue.get_mut_socket() {
             Socket::Inactive(Some(local)) => {
                 // Check if there isn't a socket listening on this address/port pair.
-                if self.addresses.contains_key(&SocketId::Passive(*local)) {
-                    if *self.addresses.get(&SocketId::Passive(*local)).unwrap() != qd {
+                if let Some(existing_qd) = self.runtime.get_qd_from_socket_id(&SocketId::Passive(*local)) {
+                    if existing_qd != qd {
                         return Err(Fail::new(
                             libc::EADDRINUSE,
                             "another socket is already listening on the same address/port pair",
@@ -275,13 +232,11 @@ impl<const N: usize> SharedTcpPeer<N> {
                     backlog,
                     self.runtime.clone(),
                     self.transport.clone(),
-                    self.clock.clone(),
                     self.tcp_config.clone(),
                     self.local_link_addr,
                     self.arp.clone(),
                     nonce,
                 );
-                self.addresses.insert(SocketId::Passive(local.clone()), qd);
                 queue.set_socket(Socket::Listening(socket));
                 Ok(())
             },
@@ -322,13 +277,17 @@ impl<const N: usize> SharedTcpPeer<N> {
         let new_qd: QDesc = self.runtime.alloc_queue::<SharedTcpQueue<N>>(new_queue.clone());
         // Set up established socket data structure.
         let established: EstablishedSocket<N> =
-            EstablishedSocket::new(cb, new_qd, self.dead_socket_tx.clone(), self.runtime.clone())?;
+            EstablishedSocket::new(cb, self.dead_socket_tx.clone(), self.runtime.clone())?;
         let local: SocketAddrV4 = established.cb.get_local();
         let remote: SocketAddrV4 = established.cb.get_remote();
         // Set the socket in the new queue to established
         new_queue.set_socket(Socket::Established(established));
         // Insert new connection into the backmap of addresses to queues.
-        if self.addresses.insert(SocketId::Active(local, remote), new_qd).is_some() {
+        if self
+            .runtime
+            .insert_socket_id_to_qd(SocketId::Active(local, remote), new_qd)
+            .is_some()
+        {
             panic!("duplicate queue descriptor in established sockets table");
         }
         // TODO: Reset the connection if the following following check fails, instead of panicking.
@@ -358,7 +317,7 @@ impl<const N: usize> SharedTcpPeer<N> {
                     Some(local) => local.clone(),
                     None => {
                         // TODO: we should free this when closing.
-                        let local_port: u16 = self.ephemeral_ports.alloc_any()?;
+                        let local_port: u16 = self.runtime.alloc_ephemeral_port()?;
                         SocketAddrV4::new(self.local_ipv4_addr, local_port)
                     },
                 };
@@ -373,7 +332,6 @@ impl<const N: usize> SharedTcpPeer<N> {
                         self.transport.clone(),
                         self.tcp_config.clone(),
                         self.local_link_addr,
-                        self.clock.clone(),
                         self.arp.clone(),
                     )?,
                     local,
@@ -386,11 +344,20 @@ impl<const N: usize> SharedTcpPeer<N> {
         };
         // Update socket state.
         queue.set_socket(Socket::Connecting(socket.clone()));
-        self.addresses.insert(SocketId::Active(local, remote.clone()), qd);
+        if let Some(existing_qd) = self
+            .runtime
+            .insert_socket_id_to_qd(SocketId::Active(local, remote.clone()), qd)
+        {
+            // We should panic here because the ephemeral port allocator should not allocate the same port more than
+            // once.
+            panic!(
+                "There is already a queue listening on this queue descriptor {:?}",
+                existing_qd
+            );
+        }
         let cb: SharedControlBlock<N> = socket.get_result(yielder).await?;
         let new_socket = Socket::Established(EstablishedSocket::new(
             cb,
-            qd,
             self.dead_socket_tx.clone(),
             self.runtime.clone(),
         )?);
@@ -488,7 +455,10 @@ impl<const N: usize> SharedTcpPeer<N> {
         };
 
         // TODO: remove active sockets from the addresses table.
-        self.addresses.remove(&SocketId::Passive(addr));
+        match self.runtime.remove_socket_id_to_qd(&SocketId::Passive(addr)) {
+            Some(existing_qd) if existing_qd == qd => {},
+            _ => return Err(Fail::new(libc::EINVAL, "socket id did not map to this qd!")),
+        };
         result
     }
 
@@ -518,14 +488,22 @@ impl<const N: usize> SharedTcpPeer<N> {
                 self.get_shared_queue(&qd)?.set_socket(Socket::Closing(socket.clone()));
                 // TODO: Wait for the close protocol to finish here.
                 // Remove address from backmap.
-                self.addresses
-                    .remove(&SocketId::Active(socket.endpoints().0, socket.endpoints().1));
+                match self
+                    .runtime
+                    .remove_socket_id_to_qd(&SocketId::Active(socket.endpoints().0, socket.endpoints().1))
+                {
+                    Some(existing_qd) if existing_qd == qd => {},
+                    _ => return Err(Fail::new(libc::EINVAL, "socket id did not map to this qd!")),
+                };
             },
             // Closing an unbound socket.
             Socket::Inactive(None) => {},
             Socket::Inactive(Some(addr)) => {
                 // Remove address from backmap.
-                self.addresses.remove(&SocketId::Passive(addr.clone()));
+                match self.runtime.remove_socket_id_to_qd(&SocketId::Passive(addr.clone())) {
+                    Some(existing_qd) if existing_qd == qd => {},
+                    _ => return Err(Fail::new(libc::EINVAL, "socket id did not map to this qd!")),
+                };
             },
             // Closing a listening socket.
             Socket::Listening(_) => {
@@ -579,17 +557,6 @@ impl<const N: usize> SharedTcpPeer<N> {
         }
     }
 
-    /// Checks if the given `local` address is in use.
-    fn addr_in_use(&self, local: SocketAddrV4) -> bool {
-        for (socket_id, _) in &self.addresses {
-            match socket_id {
-                SocketId::Passive(addr) | SocketId::Active(addr, _) if *addr == local => return true,
-                _ => continue,
-            }
-        }
-        false
-    }
-
     fn get_shared_queue(&self, qd: &QDesc) -> Result<SharedTcpQueue<N>, Fail> {
         self.runtime.get_shared_queue::<SharedTcpQueue<N>>(qd)
     }
@@ -609,9 +576,9 @@ impl<const N: usize> SharedTcpPeer<N> {
         }
 
         // Retrieve the queue descriptor based on the incoming segment.
-        let &qd: &QDesc = match self.addresses.get(&SocketId::Active(local, remote)) {
+        let qd: QDesc = match self.runtime.get_qd_from_socket_id(&SocketId::Active(local, remote)) {
             Some(qdesc) => qdesc,
-            None => match self.addresses.get(&SocketId::Passive(local)) {
+            None => match self.runtime.get_qd_from_socket_id(&SocketId::Passive(local)) {
                 Some(qdesc) => qdesc,
                 None => {
                     let cause: String = format!("no queue descriptor for remote address (remote={})", remote.ip());

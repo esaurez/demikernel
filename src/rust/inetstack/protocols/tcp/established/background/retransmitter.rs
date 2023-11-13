@@ -20,7 +20,7 @@ use ::std::time::{
     Instant,
 };
 
-pub async fn retransmitter<const N: usize>(mut cb: SharedControlBlock<N>) -> Result<!, Fail> {
+pub async fn retransmitter<const N: usize>(mut cb: SharedControlBlock<N>, yielder: Yielder) -> Result<!, Fail> {
     loop {
         // Pin future for timeout retransmission.
         let mut rtx_deadline_watched: SharedWatchedValue<Option<Instant>> = cb.watch_retransmit_deadline();
@@ -28,10 +28,9 @@ pub async fn retransmitter<const N: usize>(mut cb: SharedControlBlock<N>) -> Res
         let rtx_deadline: Option<Instant> = rtx_deadline_watched.get();
         let rtx_deadline_changed = rtx_deadline_watched.watch(rtx_yielder).fuse();
         futures::pin_mut!(rtx_deadline_changed);
-        let clock_ref: SharedTimer = cb.clock.clone();
-        let yielder: Yielder = Yielder::new();
+        let clock_ref: SharedTimer = cb.get_timer();
         let rtx_future = match rtx_deadline {
-            Some(t) => Either::Left(clock_ref.wait_until(t, yielder).fuse()),
+            Some(t) => Either::Left(clock_ref.wait_until(t, &yielder).fuse()),
             None => Either::Right(future::pending()),
         };
         futures::pin_mut!(rtx_future);
@@ -52,11 +51,17 @@ pub async fn retransmitter<const N: usize>(mut cb: SharedControlBlock<N>) -> Res
         }
         futures::pin_mut!(rtx_fast_retransmit_changed);
 
+        // Since these futures all share a single waker bit, they are all woken whenever one of them triggers.
         futures::select_biased! {
             _ = rtx_deadline_changed => continue,
             _ = rtx_fast_retransmit_changed => continue,
             _ = rtx_future => {
-                trace!("Retransmission Timer Expired");
+                match cb.get_retransmit_deadline() {
+                    Some(timeout) if timeout > cb.get_now() => continue,
+                    None => continue,
+                    _ => {},
+                }
+
                 // Notify congestion control about RTO.
                 // TODO: Is this the best place for this?
                 // TODO: Why call into ControlBlock to get SND.UNA when congestion_control_on_rto() has access to it?
@@ -71,7 +76,7 @@ pub async fn retransmitter<const N: usize>(mut cb: SharedControlBlock<N>) -> Res
 
                 // RFC 6298 Section 5.6: Restart the retransmission timer with the new RTO.
                 let rto: Duration = cb.rto();
-                let deadline: Instant = cb.clock.now() + rto;
+                let deadline: Instant = cb.get_now() + rto;
                 cb.set_retransmit_deadline(Some(deadline));
             },
         }

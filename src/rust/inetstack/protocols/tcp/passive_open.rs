@@ -48,6 +48,7 @@ use crate::{
     scheduler::{
         TaskHandle,
         Yielder,
+        YielderHandle,
     },
 };
 use ::libc::{
@@ -80,6 +81,7 @@ struct InflightAccept {
     remote_window_scale: Option<u8>,
     mss: usize,
     handle: TaskHandle,
+    yielder_handle: YielderHandle,
 }
 
 #[derive(Default)]
@@ -119,7 +121,6 @@ pub struct PassiveSocket<const N: usize> {
     local: SocketAddrV4,
     runtime: SharedDemiRuntime,
     transport: SharedBox<dyn NetworkRuntime<N>>,
-    clock: SharedTimer,
     tcp_config: TcpConfig,
     local_link_addr: MacAddress,
     arp: SharedArpPeer<N>,
@@ -138,7 +139,6 @@ impl<const N: usize> SharedPassiveSocket<N> {
         max_backlog: usize,
         runtime: SharedDemiRuntime,
         transport: SharedBox<dyn NetworkRuntime<N>>,
-        clock: SharedTimer,
         tcp_config: TcpConfig,
         local_link_addr: MacAddress,
         arp: SharedArpPeer<N>,
@@ -153,7 +153,6 @@ impl<const N: usize> SharedPassiveSocket<N> {
             local_link_addr,
             runtime,
             transport,
-            clock,
             tcp_config,
             arp,
         }))
@@ -215,7 +214,8 @@ impl<const N: usize> SharedPassiveSocket<N> {
                 local_window_scale, remote_window_scale
             );
 
-            if let Some(inflight) = self.inflight.remove(&remote) {
+            if let Some(mut inflight) = self.inflight.remove(&remote) {
+                inflight.yielder_handle.wake_with(Ok(()));
                 if let Err(e) = self.runtime.remove_background_coroutine(&inflight.handle) {
                     panic!("Failed to remove inflight accept (error={:?})", e);
                 }
@@ -226,7 +226,6 @@ impl<const N: usize> SharedPassiveSocket<N> {
                 remote,
                 self.runtime.clone(),
                 self.transport.clone(),
-                self.clock.clone(),
                 self.local_link_addr,
                 self.tcp_config.clone(),
                 self.arp.clone(),
@@ -263,7 +262,9 @@ impl<const N: usize> SharedPassiveSocket<N> {
         let local: SocketAddrV4 = self.local.clone();
         let local_isn = self.isn_generator.generate(&local, &remote);
         let remote_isn = header.seq_num;
-        let future = self.clone().background(remote, remote_isn, local_isn);
+        let yielder: Yielder = Yielder::new();
+        let yielder_handle: YielderHandle = yielder.get_handle();
+        let future = self.clone().background(remote, remote_isn, local_isn, yielder);
         let handle: TaskHandle = self
             .runtime
             .insert_background_coroutine("Inetstack::TCP::passiveopen::background", Box::pin(future))?;
@@ -290,12 +291,13 @@ impl<const N: usize> SharedPassiveSocket<N> {
             remote_window_scale,
             mss,
             handle,
+            yielder_handle,
         };
         self.inflight.insert(remote, accept);
         Ok(())
     }
 
-    async fn background(mut self, remote: SocketAddrV4, remote_isn: SeqNumber, local_isn: SeqNumber) {
+    async fn background(mut self, remote: SocketAddrV4, remote_isn: SeqNumber, local_isn: SeqNumber, yielder: Yielder) {
         let handshake_retries: usize = self.tcp_config.get_handshake_retries();
         let handshake_timeout: Duration = self.tcp_config.get_handshake_timeout();
 
@@ -330,9 +332,8 @@ impl<const N: usize> SharedPassiveSocket<N> {
                 tx_checksum_offload: self.tcp_config.get_rx_checksum_offload(),
             };
             self.transport.transmit(Box::new(segment));
-            let clock_ref: SharedTimer = self.clock.clone();
-            let yielder: Yielder = Yielder::new();
-            if let Err(e) = clock_ref.wait(handshake_timeout, yielder).await {
+            let clock_ref: SharedTimer = self.runtime.get_timer();
+            if let Err(e) = clock_ref.wait(handshake_timeout, &yielder).await {
                 self.ready.push_err(e);
                 return;
             }

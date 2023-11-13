@@ -47,6 +47,7 @@ use crate::{
     scheduler::{
         TaskHandle,
         Yielder,
+        YielderHandle,
     },
 };
 use ::libc::{
@@ -73,12 +74,12 @@ pub struct ActiveOpenSocket<const N: usize> {
     remote: SocketAddrV4,
     runtime: SharedDemiRuntime,
     transport: SharedBox<dyn NetworkRuntime<N>>,
-    clock: SharedTimer,
     local_link_addr: MacAddress,
     tcp_config: TcpConfig,
     arp: SharedArpPeer<N>,
     result: AsyncValue<Result<SharedControlBlock<N>, Fail>>,
     handle: Option<TaskHandle>,
+    yielder_handle: YielderHandle,
 }
 
 #[derive(Clone)]
@@ -97,26 +98,27 @@ impl<const N: usize> SharedActiveOpenSocket<N> {
         transport: SharedBox<dyn NetworkRuntime<N>>,
         tcp_config: TcpConfig,
         local_link_addr: MacAddress,
-        clock: SharedTimer,
         arp: SharedArpPeer<N>,
     ) -> Result<Self, Fail> {
+        let yielder: Yielder = Yielder::new();
+        let yielder_handle: YielderHandle = yielder.get_handle();
         let mut me: Self = Self(SharedObject::<ActiveOpenSocket<N>>::new(ActiveOpenSocket::<N> {
             local_isn,
             local,
             remote,
             runtime: runtime.clone(),
             transport,
-            clock,
             local_link_addr,
             tcp_config,
             arp,
             result: AsyncValue::<Result<SharedControlBlock<N>, Fail>>::default(),
             handle: None,
+            yielder_handle,
         }));
 
         let handle: TaskHandle = runtime.insert_background_coroutine(
             "Inetstack::TCP::activeopen::background",
-            Box::pin(me.clone().background()),
+            Box::pin(me.clone().background(yielder)),
         )?;
         me.handle = Some(handle);
         // TODO: Add fast path here when remote is already in the ARP cache (and subtract one retry).
@@ -214,7 +216,6 @@ impl<const N: usize> SharedActiveOpenSocket<N> {
             self.remote,
             self.runtime.clone(),
             self.transport.clone(),
-            self.clock.clone(),
             self.local_link_addr,
             self.tcp_config.clone(),
             self.arp.clone(),
@@ -230,13 +231,14 @@ impl<const N: usize> SharedActiveOpenSocket<N> {
             None,
         );
         self.result.set(Ok(cb));
+        self.yielder_handle.wake_with(Ok(()));
         let handle: TaskHandle = self.handle.take().expect("We should have allocated a background task");
         if let Err(e) = self.runtime.remove_background_coroutine(&handle) {
             panic!("Failed to remove active open coroutine (error={:?}", e);
         }
     }
 
-    async fn background(mut self) {
+    async fn background(mut self, yielder: Yielder) {
         let handshake_retries: usize = self.tcp_config.get_handshake_retries();
         let handshake_timeout = self.tcp_config.get_handshake_timeout();
         for _ in 0..handshake_retries {
@@ -269,9 +271,8 @@ impl<const N: usize> SharedActiveOpenSocket<N> {
                 tx_checksum_offload: self.tcp_config.get_rx_checksum_offload(),
             };
             self.transport.transmit(Box::new(segment));
-            let clock_ref: SharedTimer = self.clock.clone();
-            let yielder: Yielder = Yielder::new();
-            if let Err(e) = clock_ref.wait(handshake_timeout, yielder).await {
+            let clock_ref: SharedTimer = self.runtime.get_timer();
+            if let Err(e) = clock_ref.wait(handshake_timeout, &yielder).await {
                 self.result.set(Err(e));
                 return;
             }

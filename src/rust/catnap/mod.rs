@@ -8,23 +8,14 @@ mod socket;
 // Imports
 //==============================================================================
 
-#[cfg(target_os = "linux")]
-use crate::pal::linux::socketaddrv4_to_sockaddr;
-
-#[cfg(target_os = "windows")]
-use crate::pal::functions::socketaddrv4_to_sockaddr;
-
 use crate::{
     catnap::queue::SharedCatnapQueue,
     demikernel::config::Config,
-    pal::{
-        constants::{
-            AF_INET_VALUE,
-            SOCK_DGRAM,
-            SOCK_STREAM,
-            SOMAXCONN,
-        },
-        data_structures::SockAddr,
+    pal::constants::{
+        AF_INET_VALUE,
+        SOCK_DGRAM,
+        SOCK_STREAM,
+        SOMAXCONN,
     },
     runtime::{
         fail::Fail,
@@ -33,19 +24,18 @@ use crate::{
             DemiBuffer,
             MemoryRuntime,
         },
-        network::unwrap_socketaddr,
+        network::{
+            socket::SocketId,
+            unwrap_socketaddr,
+        },
         queue::{
             downcast_queue,
-            downcast_queue_ptr,
             NetworkQueue,
             Operation,
             OperationResult,
-            OperationTask,
         },
         types::{
-            demi_accept_result_t,
             demi_opcode_t,
-            demi_qr_value_t,
             demi_qresult_t,
             demi_sgarray_t,
         },
@@ -60,7 +50,6 @@ use crate::{
     },
 };
 use ::std::{
-    mem,
     net::{
         Ipv4Addr,
         SocketAddr,
@@ -163,14 +152,18 @@ impl SharedCatnapLibOS {
         }
 
         // Check wether the address is in use.
-        if self.addr_in_use(local) {
+        if self.runtime.addr_in_use(local) {
             let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
             error!("bind(): {}", &cause);
             return Err(Fail::new(libc::EADDRINUSE, &cause));
         }
 
         // Issue bind operation.
-        self.get_shared_queue(&qd)?.bind(local)
+        self.get_shared_queue(&qd)?.bind(local)?;
+        // Insert into address to queue descriptor table.
+        self.runtime
+            .insert_socket_id_to_qd(SocketId::Passive(local.clone()), qd);
+        Ok(())
     }
 
     /// Sets a SharedCatnapQueue and its underlying socket as a passive one. This function contains the libOS-level
@@ -184,7 +177,6 @@ impl SharedCatnapLibOS {
         debug_assert!((backlog > 0) && (backlog <= SOMAXCONN as usize));
 
         // Issue listen operation.
-
         self.get_shared_queue(&qd)?.listen(backlog)
     }
 
@@ -221,6 +213,7 @@ impl SharedCatnapLibOS {
         // Wait for the accept operation to complete.
         match queue.do_accept(yielder).await {
             Ok(new_queue) => {
+                // TODO: Do we need to add this to the socket id to queue descriptor table?
                 // It is safe to call except here because the new queue is connected and it should be connected to a
                 // remote address.
                 let addr: SocketAddrV4 = new_queue
@@ -271,7 +264,10 @@ impl SharedCatnapLibOS {
         };
         // Wait for connect operation to complete.
         match queue.do_connect(remote, yielder).await {
-            Ok(()) => (qd, OperationResult::Connect),
+            Ok(()) => {
+                // TODO: Do we need to add this to socket id to queue descriptor table?
+                (qd, OperationResult::Connect)
+            },
             Err(e) => {
                 warn!("connect() failed (qd={:?}, error={:?})", qd, e.cause);
                 (qd, OperationResult::Failed(e))
@@ -284,8 +280,16 @@ impl SharedCatnapLibOS {
         #[cfg(feature = "profiler")]
         timer!("catnap::close");
         trace!("close() qd={:?}", qd);
+
+        let mut queue: SharedCatnapQueue = self.get_shared_queue(&qd)?;
         // Issue close operation.
-        self.get_shared_queue(&qd)?.close()?;
+        queue.close()?;
+
+        // If the queue was bound, remove from the socket id to queue descriptor table.
+        if let Some(local) = queue.local() {
+            self.runtime.remove_socket_id_to_qd(&SocketId::Passive(local));
+        }
+
         // Remove the queue from the queue table.
         self.runtime.free_queue::<SharedCatnapQueue>(&qd)?;
         Ok(())
@@ -323,6 +327,10 @@ impl SharedCatnapLibOS {
         // Wait for close operation to complete.
         match queue.do_close(yielder).await {
             Ok(()) => {
+                // If the queue was bound, remove from the socket id to queue descriptor table.
+                if let Some(local) = queue.local() {
+                    self.runtime.remove_socket_id_to_qd(&SocketId::Passive(local));
+                }
                 // Remove the queue from the queue table. Expect is safe here because we looked up the queue to
                 // schedule this coroutine and no other close coroutine should be able to run due to state machine
                 // checks.
@@ -487,8 +495,22 @@ impl SharedCatnapLibOS {
     pub fn pack_result(&mut self, handle: TaskHandle, qt: QToken) -> Result<demi_qresult_t, Fail> {
         #[cfg(feature = "profiler")]
         timer!("catnap::pack_result");
-        let (qd, r): (QDesc, OperationResult) = self.take_result(handle);
-        Ok(pack_result(&self.runtime, r, qd, qt.into()))
+        let result: demi_qresult_t = self.runtime.remove_coroutine_and_get_result(&handle, qt.into());
+        self.remove_pending_op_if_needed(&result, handle);
+        Ok(result)
+    }
+
+    fn remove_pending_op_if_needed(&mut self, result: &demi_qresult_t, handle: TaskHandle) {
+        match result.qr_opcode {
+            // The queue would already have been freed for Close, so nothing left to do here.
+            demi_opcode_t::DEMI_OPC_CLOSE => {},
+            _ => {
+                match self.get_shared_queue(&QDesc::from(result.qr_qd)) {
+                    Ok(mut queue) => queue.remove_pending_op(&handle),
+                    Err(_) => warn!("catnap: qd={:?}, lingering pending op found", result.qr_qd),
+                };
+            },
+        }
     }
 
     /// Allocates a scatter-gather array.
@@ -505,38 +527,6 @@ impl SharedCatnapLibOS {
         timer!("catnap::sgafree");
         trace!("sgafree()");
         self.runtime.free_sgarray(sga)
-    }
-
-    /// Takes out the result from the [OperationTask] associated with the target [TaskHandle].
-    fn take_result(&mut self, handle: TaskHandle) -> (QDesc, OperationResult) {
-        #[cfg(feature = "take_result")]
-        timer!("catnap::take_result");
-        let task: OperationTask = self.runtime.remove_coroutine(&handle);
-
-        let (qd, result): (QDesc, OperationResult) = task.get_result().expect("The coroutine has not finished");
-        match result {
-            OperationResult::Close => {},
-            _ => {
-                match self.get_shared_queue(&qd) {
-                    Ok(mut queue) => queue.remove_pending_op(&handle),
-                    Err(_) => debug!("Catnap::take_result() qd={:?}, This queue was closed", qd),
-                };
-            },
-        }
-
-        (qd, result)
-    }
-
-    fn addr_in_use(&self, local: SocketAddrV4) -> bool {
-        for (_, queue) in self.runtime.get_qtable().get_values() {
-            if let Ok(catnap_queue) = downcast_queue_ptr::<SharedCatnapQueue>(queue) {
-                match catnap_queue.local() {
-                    Some(addr) if addr == local => return true,
-                    _ => continue,
-                }
-            }
-        }
-        false
     }
 
     /// This function gets a shared queue reference out of the I/O queue table. The type if a ref counted pointer to the queue itself.
@@ -578,87 +568,5 @@ impl Deref for SharedCatnapLibOS {
 impl DerefMut for SharedCatnapLibOS {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.deref_mut()
-    }
-}
-
-//==============================================================================
-// Standalone Functions
-//==============================================================================
-
-/// Packs a [OperationResult] into a [demi_qresult_t].
-fn pack_result(rt: &SharedDemiRuntime, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
-    match result {
-        OperationResult::Connect => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Accept((new_qd, addr)) => {
-            let saddr: SockAddr = socketaddrv4_to_sockaddr(&addr);
-            let qr_value: demi_qr_value_t = demi_qr_value_t {
-                ares: demi_accept_result_t {
-                    qd: new_qd.into(),
-                    addr: saddr,
-                },
-            };
-            demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_ACCEPT,
-                qr_qd: qd.into(),
-                qr_qt: qt,
-                qr_ret: 0,
-                qr_value,
-            }
-        },
-        OperationResult::Push => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_PUSH,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Pop(addr, bytes) => match rt.into_sgarray(bytes) {
-            Ok(mut sga) => {
-                if let Some(addr) = addr {
-                    sga.sga_addr = socketaddrv4_to_sockaddr(&addr);
-                }
-                let qr_value: demi_qr_value_t = demi_qr_value_t { sga };
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_POP,
-                    qr_qd: qd.into(),
-                    qr_qt: qt,
-                    qr_ret: 0,
-                    qr_value,
-                }
-            },
-            Err(e) => {
-                warn!("Operation Failed: {:?}", e);
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                    qr_qd: qd.into(),
-                    qr_qt: qt,
-                    qr_ret: e.errno as i64,
-                    qr_value: unsafe { mem::zeroed() },
-                }
-            },
-        },
-        OperationResult::Close => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_CLOSE,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Failed(e) => {
-            warn!("Operation Failed: {:?}", e);
-            demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                qr_qd: qd.into(),
-                qr_qt: qt,
-                qr_ret: e.errno as i64,
-                qr_value: unsafe { mem::zeroed() },
-            }
-        },
     }
 }

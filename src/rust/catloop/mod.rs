@@ -17,12 +17,7 @@ use crate::{
     catmem::SharedCatmemLibOS,
     demi_sgarray_t,
     demikernel::config::Config,
-    inetstack::protocols::ip::EphemeralPorts,
-    pal::{
-        constants::SOMAXCONN,
-        data_structures::SockAddr,
-        linux,
-    },
+    pal::constants::SOMAXCONN,
     runtime::{
         fail::Fail,
         limits,
@@ -30,17 +25,16 @@ use crate::{
             DemiBuffer,
             MemoryRuntime,
         },
-        network::unwrap_socketaddr,
-        queue::downcast_queue_ptr,
+        network::{
+            socket::SocketId,
+            unwrap_socketaddr,
+        },
         types::{
-            demi_accept_result_t,
             demi_opcode_t,
-            demi_qr_value_t,
             demi_qresult_t,
         },
         Operation,
         OperationResult,
-        OperationTask,
         QDesc,
         QToken,
         SharedDemiRuntime,
@@ -52,12 +46,7 @@ use crate::{
     },
     QType,
 };
-use ::rand::{
-    prelude::SmallRng,
-    SeedableRng,
-};
 use ::std::{
-    mem,
     net::{
         Ipv4Addr,
         SocketAddr,
@@ -82,8 +71,6 @@ use crate::timer;
 /// functionality necessary to run the Catloop libOS. All state is kept in the [state], while [runtime] holds the
 /// coroutine scheduler and [catmem] holds a reference to the underlying Catmem libOS instance.
 pub struct CatloopLibOS {
-    /// Ephemeral port allocator.
-    ephemeral_ports: EphemeralPorts,
     /// Underlying transport.
     catmem: SharedCatmemLibOS,
     /// Underlying coroutine runtime.
@@ -100,25 +87,11 @@ pub struct SharedCatloopLibOS(SharedObject<CatloopLibOS>);
 //======================================================================================================================
 
 impl CatloopLibOS {
-    /// Seed number of ephemeral port allocator.
-    const EPHEMERAL_PORT_SEED: u64 = 12345;
-
     /// Instantiates a new LibOS.
     pub fn new(config: &Config, runtime: SharedDemiRuntime) -> Self {
         #[cfg(feature = "profiler")]
         timer!("catloop::new");
-        let mut rng: SmallRng = {
-            #[cfg(debug_assertions)]
-            {
-                SmallRng::seed_from_u64(Self::EPHEMERAL_PORT_SEED)
-            }
-            #[cfg(not(debug_assertions))]
-            {
-                SmallRng::from_entropy()
-            }
-        };
         Self {
-            ephemeral_ports: EphemeralPorts::new(&mut rng),
             catmem: SharedCatmemLibOS::new(config, runtime.clone()),
             runtime,
             config: config.clone(),
@@ -200,19 +173,27 @@ impl SharedCatloopLibOS {
         }
 
         // Check whether the address is in use.
-        if self.addr_in_use(local) {
+        if self.runtime.addr_in_use(local) {
             let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
             error!("bind(): {}", cause);
             return Err(Fail::new(libc::EADDRINUSE, &cause));
         }
         // Check if this is an ephemeral port.
-        if EphemeralPorts::is_private(local.port()) {
+        if SharedDemiRuntime::is_private_ephemeral_port(local.port()) {
             // Allocate ephemeral port from the pool, to leave ephemeral port allocator in a consistent state.
-            self.alloc_ephemeral_port(Some(local.port()))?;
+            self.runtime.reserve_ephemeral_port(local.port())?;
         }
 
         // Check if queue descriptor is valid.
         let mut queue: SharedCatloopQueue = self.get_queue(&qd)?;
+        if let Some(existing_qd) = self
+            .runtime
+            .insert_socket_id_to_qd(SocketId::Passive(local.clone()), qd)
+        {
+            let cause: String = format!("There is already a socket bound to this address: {:?}", existing_qd);
+            warn!("{}", cause);
+            return Err(Fail::new(libc::EADDRINUSE, &cause));
+        }
 
         // Check that the socket associated with the queue is not listening.
         queue.bind(local)
@@ -242,10 +223,7 @@ impl SharedCatloopLibOS {
         trace!("accept() qd={:?}", qd);
 
         // Allocate ephemeral port.
-        let new_port: u16 = match self.alloc_ephemeral_port(None) {
-            Ok(new_port) => new_port.unwrap(),
-            Err(e) => return Err(e),
-        };
+        let new_port: u16 = self.runtime.alloc_ephemeral_port()?;
         let mut queue: SharedCatloopQueue = self.get_queue(&qd)?;
         // Create coroutine to run this accept.
         let coroutine = |yielder: Yielder| -> Result<TaskHandle, Fail> {
@@ -273,6 +251,7 @@ impl SharedCatloopLibOS {
         match result {
             Ok(new_queue) => {
                 let new_qd: QDesc = self.runtime.alloc_queue::<SharedCatloopQueue>(new_queue);
+                // TODO: insert into socket id to queue descriptor table?
                 let new_addr: SocketAddrV4 = SocketAddrV4::new(
                     *queue
                         .local()
@@ -284,7 +263,7 @@ impl SharedCatloopLibOS {
             },
             Err(e) => {
                 // Rollback the port allocation.
-                if self.free_ephemeral_port(new_port).is_err() {
+                if self.runtime.free_ephemeral_port(new_port).is_err() {
                     // We fail if and only if we attempted to free a port that was not allocated.
                     // This is unexpected, but if it happens, issue a warning and keep going,
                     // otherwise we would leave the queue in a dangling state.
@@ -328,6 +307,7 @@ impl SharedCatloopLibOS {
 
         // Wait for connect operation to complete.
         match queue.do_connect(remote, &yielder).await {
+            // TODO: insert into socket id to queue descriptor table?
             Ok(()) => (qd, OperationResult::Connect),
             Err(e) => {
                 warn!("connect() failed (qd={:?}, error={:?})", qd, e.cause);
@@ -344,14 +324,15 @@ impl SharedCatloopLibOS {
         let mut queue: SharedCatloopQueue = self.get_queue(&qd)?;
         queue.close()?;
         if let Some(addr) = queue.local() {
-            if EphemeralPorts::is_private(addr.port()) {
-                if self.free_ephemeral_port(addr.port()).is_err() {
+            if SharedDemiRuntime::is_private_ephemeral_port(addr.port()) {
+                if self.runtime.free_ephemeral_port(addr.port()).is_err() {
                     // We fail if and only if we attempted to free a port that was not allocated.
                     // This is unexpected, but if it happens, issue a warning and keep going,
                     // otherwise we would leave the queue in a dangling state.
                     warn!("close(): leaking ephemeral port (port={})", addr.port());
                 }
             }
+            self.runtime.remove_socket_id_to_qd(&SocketId::Passive(addr));
         }
         // Expect is safe here because we looked up the queue to close it.
         self.runtime
@@ -393,14 +374,15 @@ impl SharedCatloopLibOS {
         match queue.do_close(yielder).await {
             Ok((_, OperationResult::Close)) => {
                 if let Some(addr) = queue.local() {
-                    if EphemeralPorts::is_private(addr.port()) {
-                        if self.free_ephemeral_port(addr.port()).is_err() {
+                    if SharedDemiRuntime::is_private_ephemeral_port(addr.port()) {
+                        if self.runtime.free_ephemeral_port(addr.port()).is_err() {
                             // We fail if and only if we attempted to free a port that was not allocated.
                             // This is unexpected, but if it happens, issue a warning and keep going,
                             // otherwise we would leave the queue in a dangling state.
                             warn!("close(): leaking ephemeral port (port={})", addr.port());
                         }
                     }
+                    self.runtime.remove_socket_id_to_qd(&SocketId::Passive(addr));
                 }
                 // Expect is safe here because we looked up the queue to schedule this coroutine and no other close
                 // coroutine should be able to run due to state machine checks.
@@ -523,11 +505,9 @@ impl SharedCatloopLibOS {
     pub fn pack_result(&mut self, handle: TaskHandle, qt: QToken) -> Result<demi_qresult_t, Fail> {
         #[cfg(feature = "profiler")]
         timer!("catloop::pack_result");
-        // Construct operation result.
-        let (qd, r): (QDesc, OperationResult) = self.take_result(handle);
-        let qr: demi_qresult_t = pack_result(&self.runtime, r, qd, qt.into());
-
-        return Ok(qr);
+        let result: demi_qresult_t = self.runtime.remove_coroutine_and_get_result(&handle, qt.into());
+        self.remove_pending_op_if_needed(&result, handle);
+        Ok(result)
     }
 
     /// Polls scheduling queues.
@@ -537,52 +517,21 @@ impl SharedCatloopLibOS {
         self.runtime.poll()
     }
 
-    /// Takes out the [OperationResult] associated with the target [TaskHandle].
-    fn take_result(&mut self, handle: TaskHandle) -> (QDesc, OperationResult) {
-        #[cfg(feature = "profiler")]
-        timer!("catloop::take_result");
-        let task: OperationTask = self.runtime.remove_coroutine(&handle);
-        let (qd, result): (QDesc, OperationResult) = task.get_result().expect("The coroutine has not finished");
-
-        match self.get_queue(&qd) {
-            Ok(mut queue) => queue.remove_pending_op(&handle),
-            Err(_) => debug!("take_result(): this queue was closed (qd={:?})", qd),
-        };
-
-        (qd, result)
-    }
-
-    fn addr_in_use(&self, local: SocketAddrV4) -> bool {
-        #[cfg(feature = "profiler")]
-        timer!("catloop::addr_in_use");
-        for (_, queue) in self.runtime.get_qtable().get_values() {
-            if let Ok(catloop_queue) = downcast_queue_ptr::<SharedCatloopQueue>(queue) {
-                match catloop_queue.local() {
-                    Some(addr) if addr == local => return true,
-                    _ => continue,
-                }
-            }
+    fn remove_pending_op_if_needed(&mut self, result: &demi_qresult_t, handle: TaskHandle) {
+        match result.qr_opcode {
+            // The queue would already have been freed for Close, so nothing left to do here.
+            demi_opcode_t::DEMI_OPC_CLOSE => {},
+            _ => {
+                match self.get_queue(&QDesc::from(result.qr_qd)) {
+                    Ok(mut queue) => queue.remove_pending_op(&handle),
+                    Err(_) => warn!("catloop: qd={:?}, lingering pending op found", result.qr_qd),
+                };
+            },
         }
-        false
     }
 
     fn get_queue(&self, qd: &QDesc) -> Result<SharedCatloopQueue, Fail> {
         Ok(self.runtime.get_qtable().get::<SharedCatloopQueue>(qd)?.clone())
-    }
-
-    /// Allocates an ephemeral port. If `port` is `Some(port)` then it tries to allocate `port`.
-    fn alloc_ephemeral_port(&mut self, port: Option<u16>) -> Result<Option<u16>, Fail> {
-        if let Some(port) = port {
-            self.ephemeral_ports.alloc_port(port)?;
-            Ok(None)
-        } else {
-            Ok(Some(self.ephemeral_ports.alloc_any()?))
-        }
-    }
-
-    /// Releases an ephemeral `port`.
-    fn free_ephemeral_port(&mut self, port: u16) -> Result<(), Fail> {
-        self.ephemeral_ports.free(port)
     }
 }
 
@@ -601,87 +550,5 @@ impl Deref for SharedCatloopLibOS {
 impl DerefMut for SharedCatloopLibOS {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.deref_mut()
-    }
-}
-
-//======================================================================================================================
-// Standalone Functions
-//======================================================================================================================
-
-/// Packs a [OperationResult] into a [demi_qresult_t].
-fn pack_result(rt: &SharedDemiRuntime, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
-    match result {
-        OperationResult::Connect => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Accept((new_qd, addr)) => {
-            let saddr: SockAddr = linux::socketaddrv4_to_sockaddr(&addr);
-            let qr_value: demi_qr_value_t = demi_qr_value_t {
-                ares: demi_accept_result_t {
-                    qd: new_qd.into(),
-                    addr: saddr,
-                },
-            };
-            demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_ACCEPT,
-                qr_qd: qd.into(),
-                qr_qt: qt,
-                qr_ret: 0,
-                qr_value,
-            }
-        },
-        OperationResult::Close => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_CLOSE,
-            qr_qd: qd.into(),
-            qr_qt: qt.into(),
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Failed(e) => {
-            warn!("Operation Failed: {:?}", e);
-            demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                qr_qd: qd.into(),
-                qr_qt: qt,
-                qr_ret: e.errno as i64,
-                qr_value: unsafe { mem::zeroed() },
-            }
-        },
-        OperationResult::Push => demi_qresult_t {
-            qr_opcode: demi_opcode_t::DEMI_OPC_PUSH,
-            qr_qd: qd.into(),
-            qr_qt: qt,
-            qr_ret: 0,
-            qr_value: unsafe { mem::zeroed() },
-        },
-        OperationResult::Pop(addr, bytes) => match rt.into_sgarray(bytes) {
-            Ok(mut sga) => {
-                if let Some(addr) = addr {
-                    sga.sga_addr = linux::socketaddrv4_to_sockaddr(&addr);
-                }
-                let qr_value: demi_qr_value_t = demi_qr_value_t { sga };
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_POP,
-                    qr_qd: qd.into(),
-                    qr_qt: qt,
-                    qr_ret: 0,
-                    qr_value,
-                }
-            },
-            Err(e) => {
-                warn!("Operation Failed: {:?}", e);
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                    qr_qd: qd.into(),
-                    qr_qt: qt,
-                    qr_ret: e.errno as i64,
-                    qr_value: unsafe { mem::zeroed() },
-                }
-            },
-        },
     }
 }

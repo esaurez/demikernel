@@ -2,17 +2,13 @@
 // Licensed under the MIT license.
 
 mod config;
-mod interop;
 pub mod runtime;
 
 //==============================================================================
 // Imports
 //==============================================================================
 
-use self::{
-    interop::pack_result,
-    runtime::SharedDPDKRuntime,
-};
+use self::runtime::SharedDPDKRuntime;
 use crate::{
     demikernel::config::Config,
     inetstack::InetStack,
@@ -30,12 +26,10 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
-        timer::SharedTimer,
         types::{
             demi_qresult_t,
             demi_sgarray_t,
         },
-        OperationResult,
         QDesc,
         QToken,
         SharedBox,
@@ -52,7 +46,6 @@ use ::std::{
         Deref,
         DerefMut,
     },
-    time::Instant,
 };
 
 #[cfg(feature = "profiler")]
@@ -93,13 +86,10 @@ impl CatnipLibOS {
         let arp_config: ArpConfig = transport.get_arp_config();
         let udp_config: UdpConfig = transport.get_udp_config();
         let tcp_config: TcpConfig = transport.get_tcp_config();
-        let now: Instant = Instant::now();
-        let clock: SharedTimer = SharedTimer::new(now);
         let rng_seed: [u8; 32] = [0; 32];
         let inetstack: InetStack<RECEIVE_BATCH_SIZE> = InetStack::new(
             runtime.clone(),
             SharedBox::<dyn NetworkRuntime<RECEIVE_BATCH_SIZE>>::new(Box::new(transport.clone())),
-            clock,
             link_addr,
             ip_addr,
             udp_config,
@@ -158,8 +148,8 @@ impl CatnipLibOS {
     }
 
     pub fn pack_result(&mut self, handle: TaskHandle, qt: QToken) -> Result<demi_qresult_t, Fail> {
-        let (qd, r): (QDesc, OperationResult) = self.take_operation(handle);
-        Ok(pack_result(&self.transport, r, qd, qt.into()))
+        let result: demi_qresult_t = self.runtime.remove_coroutine_and_get_result(&handle, qt.into());
+        Ok(result)
     }
 
     /// Allocates a scatter-gather array.

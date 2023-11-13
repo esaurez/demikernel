@@ -35,13 +35,21 @@ pub use dpdk_rs as libdpdk;
 //======================================================================================================================
 
 use crate::{
+    pal::data_structures::SockAddr,
     runtime::{
         fail::Fail,
         memory::MemoryRuntime,
+        network::{
+            ephemeral::EphemeralPorts,
+            socket::SocketId,
+            NetworkQueueTable,
+        },
         queue::{
             IoQueue,
             IoQueueTable,
         },
+        timer::SharedTimer,
+        types::demi_opcode_t,
     },
     scheduler::{
         scheduler::Scheduler,
@@ -52,12 +60,15 @@ use crate::{
 use ::std::{
     boxed::Box,
     future::Future,
+    mem,
+    net::SocketAddrV4,
     ops::{
         Deref,
         DerefMut,
     },
     pin::Pin,
     rc::Rc,
+    time::Instant,
 };
 
 #[cfg(target_os = "windows")]
@@ -67,16 +78,35 @@ use windows::Win32::Networking::WinSock::{
     WSAEWOULDBLOCK,
 };
 
+#[cfg(target_os = "windows")]
+use crate::pal::functions::socketaddrv4_to_sockaddr;
+
+#[cfg(target_os = "linux")]
+use crate::pal::linux::socketaddrv4_to_sockaddr;
+
+use self::types::{
+    demi_accept_result_t,
+    demi_qr_value_t,
+    demi_qresult_t,
+};
+
 //======================================================================================================================
 // Structures
 //======================================================================================================================
 
 /// Demikernel Runtime
+#[derive(Default)]
 pub struct DemiRuntime {
     /// Scheduler
     scheduler: Scheduler,
     /// Shared IoQueueTable.
     qtable: IoQueueTable,
+    /// Shared ephemeral port allocator.
+    ephemeral_ports: EphemeralPorts,
+    /// Shared timer for periodic triggering of coroutines and time outs.
+    timer: SharedTimer,
+    /// Shared table for mapping from underlying transport identifiers to queue descriptors.
+    network_table: NetworkQueueTable,
 }
 
 #[derive(Clone)]
@@ -90,19 +120,34 @@ pub struct SharedBox<T: ?Sized>(SharedObject<Box<T>>);
 // Associate Functions
 //======================================================================================================================
 
-impl SharedDemiRuntime {
-    pub fn new() -> Self {
-        Self(SharedObject::new(DemiRuntime::new()))
+impl DemiRuntime {
+    /// Checks if an operation should be retried based on the error code `err`.
+    pub fn should_retry(errno: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        if errno == libc::EINPROGRESS || errno == libc::EWOULDBLOCK || errno == libc::EAGAIN || errno == libc::EALREADY
+        {
+            return true;
+        }
+
+        #[cfg(target_os = "windows")]
+        if errno == WSAEWOULDBLOCK.0 || errno == WSAEINPROGRESS.0 || errno == WSAEALREADY.0 {
+            return true;
+        }
+
+        false
     }
 }
 
 /// Associate Functions for POSIX Runtime
-impl DemiRuntime {
-    pub fn new() -> Self {
-        Self {
+impl SharedDemiRuntime {
+    pub fn new(now: Instant) -> Self {
+        Self(SharedObject::<DemiRuntime>::new(DemiRuntime {
             scheduler: Scheduler::default(),
-            qtable: IoQueueTable::new(),
-        }
+            qtable: IoQueueTable::default(),
+            ephemeral_ports: EphemeralPorts::default(),
+            timer: SharedTimer::new(now),
+            network_table: NetworkQueueTable::default(),
+        }))
     }
 
     /// Inserts the `coroutine` named `task_name` into the scheduler.
@@ -129,6 +174,21 @@ impl DemiRuntime {
         // 2. Cast to void and then downcast to operation task.
         trace!("Removing coroutine: {:?}", boxed_task.get_name());
         OperationTask::from(boxed_task.as_any())
+    }
+
+    /// Removes a coroutine from the underlying scheduler given its associated [TaskHandle] `handle`
+    /// and gets the result immediately.
+    pub fn remove_coroutine_and_get_result(&mut self, handle: &TaskHandle, qt: u64) -> demi_qresult_t {
+        // 1. Remove Task from scheduler.
+        let boxed_task: Box<dyn Task> = self
+            .scheduler
+            .remove(handle)
+            .expect("Removing task that does not exist (either was previously removed or never inserted");
+        // 2. Cast to void and then downcast to operation task.
+        trace!("Removing coroutine: {:?}", boxed_task.get_name());
+        let operation_task: OperationTask = OperationTask::from(boxed_task.as_any());
+        let (qd, result) = operation_task.get_result().expect("Coroutine not finished");
+        self.pack_result(result, qd, qt)
     }
 
     /// Inserts the background `coroutine` named `task_name` into the scheduler.
@@ -184,7 +244,9 @@ impl DemiRuntime {
 
     /// Allocates a queue of type `T` and returns the associated queue descriptor.
     pub fn alloc_queue<T: IoQueue>(&mut self, queue: T) -> QDesc {
-        self.qtable.alloc::<T>(queue)
+        let qd: QDesc = self.qtable.alloc::<T>(queue);
+        trace!("Allocating new queue: qd={:?}", qd);
+        qd
     }
 
     /// Returns a reference to the I/O queue table.
@@ -199,6 +261,7 @@ impl DemiRuntime {
 
     /// Frees the queue associated with [qd] and returns the freed queue.
     pub fn free_queue<T: IoQueue>(&mut self, qd: &QDesc) -> Result<T, Fail> {
+        trace!("Freeing queue: qd={:?}", qd);
         self.qtable.free(qd)
     }
 
@@ -209,24 +272,190 @@ impl DemiRuntime {
         Ok(self.qtable.get::<T>(qd)?.clone())
     }
 
+    /// Returns the type for the queue that matches [qd].
     pub fn get_queue_type(&self, qd: &QDesc) -> Result<QType, Fail> {
         self.qtable.get_type(qd)
     }
 
-    /// Checks if an operation should be retried based on the error code `err`.
-    pub fn should_retry(errno: i32) -> bool {
-        #[cfg(target_os = "linux")]
-        if errno == libc::EINPROGRESS || errno == libc::EWOULDBLOCK || errno == libc::EAGAIN || errno == libc::EALREADY
-        {
-            return true;
+    /// Allocates a port from the shared ephemeral port allocator.
+    pub fn alloc_ephemeral_port(&mut self) -> Result<u16, Fail> {
+        match self.ephemeral_ports.alloc() {
+            Ok(port) => {
+                trace!("Allocating ephemeral port: {:?}", port);
+                Ok(port)
+            },
+            Err(e) => {
+                warn!("Could not allocate ephemeral port: {:?}", e);
+                Err(e)
+            },
         }
+    }
 
-        #[cfg(target_os = "windows")]
-        if errno == WSAEWOULDBLOCK.0 || errno == WSAEINPROGRESS.0 || errno == WSAEALREADY.0 {
-            return true;
+    /// Reserves a specific port if it is free.
+    pub fn reserve_ephemeral_port(&mut self, port: u16) -> Result<(), Fail> {
+        match self.ephemeral_ports.reserve(port) {
+            Ok(()) => {
+                trace!("Reserving ephemeral port: {:?}", port);
+                Ok(())
+            },
+            Err(e) => {
+                warn!("Could not reserve ephemeral port: port={:?} error={:?}", port, e);
+                Err(e)
+            },
         }
+    }
 
-        false
+    /// Frees an ephemeral port.
+    pub fn free_ephemeral_port(&mut self, port: u16) -> Result<(), Fail> {
+        match self.ephemeral_ports.free(port) {
+            Ok(()) => {
+                trace!("Freeing ephemeral port: {:?}", port);
+                Ok(())
+            },
+            Err(e) => {
+                warn!("Could not free ephemeral port: port={:?} error={:?}", port, e);
+                Err(e)
+            },
+        }
+    }
+
+    /// Checks if a port is private.
+    pub fn is_private_ephemeral_port(port: u16) -> bool {
+        EphemeralPorts::is_private(port)
+    }
+
+    /// Returns a reference to the shared timer.
+    pub fn get_timer(&self) -> SharedTimer {
+        self.timer.clone()
+    }
+
+    /// Moves time forward deterministically.
+    pub fn advance_clock(&mut self, now: Instant) {
+        self.timer.advance_clock(now)
+    }
+
+    /// Gets the current time according to our internal timer.
+    pub fn get_now(&self) -> Instant {
+        self.timer.now()
+    }
+
+    /// Checks if an identifier is in use and returns the queue descriptor if it is.
+    pub fn get_qd_from_socket_id(&self, id: &SocketId) -> Option<QDesc> {
+        match self.network_table.get_qd(id) {
+            Some(qd) => {
+                trace!("Looking up queue descriptor: socket_id={:?} qd={:?}", id, qd);
+                Some(qd)
+            },
+            None => {
+                trace!("Could not find queue descriptor for socket id: {:?}", id);
+                None
+            },
+        }
+    }
+
+    /// Inserts a mapping and returns the previously mapped queue descriptor if it exists.
+    pub fn insert_socket_id_to_qd(&mut self, id: SocketId, qd: QDesc) -> Option<QDesc> {
+        trace!("Insert socket id to queue descriptor mapping: {:?} -> {:?}", id, qd);
+        self.network_table.insert_qd(id, qd)
+    }
+
+    /// Removes a mapping and returns the mapped queue descriptor.
+    pub fn remove_socket_id_to_qd(&mut self, id: &SocketId) -> Option<QDesc> {
+        match self.network_table.remove_qd(id) {
+            Some(qd) => {
+                trace!("Remove socket id to queue descriptor mapping: {:?} -> {:?}", id, qd);
+                Some(qd)
+            },
+            None => {
+                trace!(
+                    "Remove but could not find socket id to queue descriptor mapping: {:?}",
+                    id
+                );
+                None
+            },
+        }
+    }
+
+    pub fn addr_in_use(&self, local: SocketAddrV4) -> bool {
+        trace!("Check address in use: {:?}", local);
+        self.network_table.addr_in_use(local)
+    }
+
+    pub fn pack_result(&self, result: OperationResult, qd: QDesc, qt: u64) -> demi_qresult_t {
+        match result {
+            OperationResult::Connect => demi_qresult_t {
+                qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
+                qr_qd: qd.into(),
+                qr_qt: qt,
+                qr_ret: 0,
+                qr_value: unsafe { mem::zeroed() },
+            },
+            OperationResult::Accept((new_qd, addr)) => {
+                let saddr: SockAddr = socketaddrv4_to_sockaddr(&addr);
+                let qr_value: demi_qr_value_t = demi_qr_value_t {
+                    ares: demi_accept_result_t {
+                        qd: new_qd.into(),
+                        addr: saddr,
+                    },
+                };
+                demi_qresult_t {
+                    qr_opcode: demi_opcode_t::DEMI_OPC_ACCEPT,
+                    qr_qd: qd.into(),
+                    qr_qt: qt,
+                    qr_ret: 0,
+                    qr_value,
+                }
+            },
+            OperationResult::Push => demi_qresult_t {
+                qr_opcode: demi_opcode_t::DEMI_OPC_PUSH,
+                qr_qd: qd.into(),
+                qr_qt: qt,
+                qr_ret: 0,
+                qr_value: unsafe { mem::zeroed() },
+            },
+            OperationResult::Pop(addr, bytes) => match self.into_sgarray(bytes) {
+                Ok(mut sga) => {
+                    if let Some(addr) = addr {
+                        sga.sga_addr = socketaddrv4_to_sockaddr(&addr);
+                    }
+                    let qr_value: demi_qr_value_t = demi_qr_value_t { sga };
+                    demi_qresult_t {
+                        qr_opcode: demi_opcode_t::DEMI_OPC_POP,
+                        qr_qd: qd.into(),
+                        qr_qt: qt,
+                        qr_ret: 0,
+                        qr_value,
+                    }
+                },
+                Err(e) => {
+                    warn!("Operation Failed: {:?}", e);
+                    demi_qresult_t {
+                        qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
+                        qr_qd: qd.into(),
+                        qr_qt: qt,
+                        qr_ret: e.errno as i64,
+                        qr_value: unsafe { mem::zeroed() },
+                    }
+                },
+            },
+            OperationResult::Close => demi_qresult_t {
+                qr_opcode: demi_opcode_t::DEMI_OPC_CLOSE,
+                qr_qd: qd.into(),
+                qr_qt: qt,
+                qr_ret: 0,
+                qr_value: unsafe { mem::zeroed() },
+            },
+            OperationResult::Failed(e) => {
+                warn!("Operation Failed: {:?}", e);
+                demi_qresult_t {
+                    qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
+                    qr_qd: qd.into(),
+                    qr_qt: qt,
+                    qr_ret: e.errno as i64,
+                    qr_value: unsafe { mem::zeroed() },
+                }
+            },
+        }
     }
 }
 
@@ -247,7 +476,13 @@ impl<T: ?Sized> SharedBox<T> {
 //======================================================================================================================
 
 /// Memory Runtime Trait Implementation for POSIX Runtime
-impl MemoryRuntime for DemiRuntime {}
+impl MemoryRuntime for SharedDemiRuntime {}
+
+impl Default for SharedDemiRuntime {
+    fn default() -> Self {
+        Self(SharedObject::new(DemiRuntime::default()))
+    }
+}
 
 impl<T> Deref for SharedObject<T> {
     type Target = T;
