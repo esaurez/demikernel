@@ -5,28 +5,14 @@
 // Imports
 //======================================================================================================================
 
-use super::{
-    active_open::SharedActiveOpenSocket,
-    established::EstablishedSocket,
-    isn_generator::IsnGenerator,
-    passive_open::SharedPassiveSocket,
-    queue::SharedTcpQueue,
-};
 use crate::{
     inetstack::protocols::{
         arp::SharedArpPeer,
-        ethernet2::{
-            EtherType2,
-            Ethernet2Header,
-        },
-        ip::IpProtocol,
         ipv4::Ipv4Header,
         tcp::{
-            established::SharedControlBlock,
-            segment::{
-                TcpHeader,
-                TcpSegment,
-            },
+            isn_generator::IsnGenerator,
+            queue::SharedTcpQueue,
+            segment::TcpHeader,
             SeqNumber,
         },
     },
@@ -39,14 +25,19 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
+        queue::NetworkQueue,
+        scheduler::{
+            TaskHandle,
+            Yielder,
+        },
         Operation,
         OperationResult,
         QDesc,
+        QToken,
         SharedBox,
         SharedDemiRuntime,
         SharedObject,
     },
-    scheduler::Yielder,
 };
 use ::futures::channel::mpsc;
 use ::rand::{
@@ -70,18 +61,6 @@ use ::std::{
 
 #[cfg(feature = "profiler")]
 use crate::timer;
-
-//======================================================================================================================
-// Enumerations
-//======================================================================================================================
-
-pub enum Socket<const N: usize> {
-    Inactive(Option<SocketAddrV4>),
-    Listening(SharedPassiveSocket<N>),
-    Connecting(SharedActiveOpenSocket<N>),
-    Established(EstablishedSocket<N>),
-    Closing(EstablishedSocket<N>),
-}
 
 //======================================================================================================================
 // Structures
@@ -132,16 +111,23 @@ impl<const N: usize> SharedTcpPeer<N> {
         })))
     }
 
-    /// Opens a TCP socket.
+    /// Creates a TCP socket.
     pub fn socket(&mut self) -> Result<QDesc, Fail> {
         #[cfg(feature = "profiler")]
         timer!("tcp::socket");
-        let new_qd: QDesc = self
-            .runtime
-            .alloc_queue::<SharedTcpQueue<N>>(SharedTcpQueue::<N>::new());
+        let new_queue: SharedTcpQueue<N> = SharedTcpQueue::<N>::new(
+            self.runtime.clone(),
+            self.transport.clone(),
+            self.local_link_addr,
+            self.tcp_config.clone(),
+            self.arp.clone(),
+            self.dead_socket_tx.clone(),
+        );
+        let new_qd: QDesc = self.runtime.alloc_queue::<SharedTcpQueue<N>>(new_queue);
         Ok(new_qd)
     }
 
+    /// Binds a socket to a local address supplied by [local].
     pub fn bind(&mut self, qd: QDesc, local: SocketAddrV4) -> Result<(), Fail> {
         // Check if we are binding to the wildcard address.
         // FIXME: https://github.com/demikernel/demikernel/issues/189
@@ -161,7 +147,7 @@ impl<const N: usize> SharedTcpPeer<N> {
 
         // TODO: Check if we are binding to a non-local address.
 
-        // Check wether the address is in use.
+        // Check whether the address is in use.
         if self.runtime.addr_in_use(local) {
             let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
             error!("bind(): {}", &cause);
@@ -175,20 +161,7 @@ impl<const N: usize> SharedTcpPeer<N> {
         }
 
         // Issue operation.
-        let ret: Result<(), Fail> = {
-            let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-            match queue.get_socket() {
-                Socket::Inactive(None) => {
-                    queue.set_socket(Socket::Inactive(Some(local)));
-                    Ok(())
-                },
-                Socket::Inactive(_) => Err(Fail::new(libc::EINVAL, "socket is already bound to an address")),
-                Socket::Listening(_) => return Err(Fail::new(libc::EINVAL, "socket is already listening")),
-                Socket::Connecting(_) => return Err(Fail::new(libc::EINVAL, "socket is connecting")),
-                Socket::Established(_) => return Err(Fail::new(libc::EINVAL, "socket is connected")),
-                Socket::Closing(_) => return Err(Fail::new(libc::EINVAL, "socket is closed")),
-            }
-        };
+        let ret: Result<(), Fail> = self.get_shared_queue(&qd)?.bind(local);
 
         // Handle return value.
         match ret {
@@ -210,351 +183,277 @@ impl<const N: usize> SharedTcpPeer<N> {
 
     // Marks the target socket as passive.
     pub fn listen(&mut self, qd: QDesc, backlog: usize) -> Result<(), Fail> {
-        // This code borrows a reference to inner, instead of the entire self structure,
-        // so we can still borrow self later.
         // Get bound address while checking for several issues.
+        // Check if there isn't a socket listening on this address/port pair.
         let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        match queue.get_mut_socket() {
-            Socket::Inactive(Some(local)) => {
-                // Check if there isn't a socket listening on this address/port pair.
-                if let Some(existing_qd) = self.runtime.get_qd_from_socket_id(&SocketId::Passive(*local)) {
-                    if existing_qd != qd {
-                        return Err(Fail::new(
-                            libc::EADDRINUSE,
-                            "another socket is already listening on the same address/port pair",
-                        ));
-                    }
+        if let Some(local) = queue.local() {
+            if let Some(existing_qd) = self.runtime.get_qd_from_socket_id(&SocketId::Passive(local)) {
+                if existing_qd != qd {
+                    return Err(Fail::new(
+                        libc::EADDRINUSE,
+                        "another socket is already listening on the same address/port pair",
+                    ));
                 }
-
-                let nonce: u32 = self.rng.gen();
-                let socket = SharedPassiveSocket::new(
-                    *local,
-                    backlog,
-                    self.runtime.clone(),
-                    self.transport.clone(),
-                    self.tcp_config.clone(),
-                    self.local_link_addr,
-                    self.arp.clone(),
-                    nonce,
-                );
-                queue.set_socket(Socket::Listening(socket));
-                Ok(())
-            },
-            Socket::Inactive(None) => {
-                return Err(Fail::new(libc::EDESTADDRREQ, "socket is not bound to a local address"))
-            },
-            Socket::Listening(_) => return Err(Fail::new(libc::EINVAL, "socket is already listening")),
-            Socket::Connecting(_) => return Err(Fail::new(libc::EINVAL, "socket is connecting")),
-            Socket::Established(_) => return Err(Fail::new(libc::EINVAL, "socket is connected")),
-            Socket::Closing(_) => return Err(Fail::new(libc::EINVAL, "socket is closed")),
+            }
+            let nonce: u32 = self.rng.gen();
+            queue.listen(backlog, nonce)
+        } else {
+            Err(Fail::new(libc::EDESTADDRREQ, "socket is not bound to a local address"))
         }
     }
 
     /// Sets up the coroutine for accepting a new connection.
-    pub fn accept(&self, qd: QDesc) -> Pin<Box<Operation>> {
-        let yielder: Yielder = Yielder::new();
-        let peer: Self = self.clone();
-        Box::pin(async move {
-            // Wait for accept to complete.
-            // Handle result: If unsuccessful, free the new queue descriptor.
-            match peer.accept_coroutine(qd, yielder).await {
-                Ok((new_qd, addr)) => (qd, OperationResult::Accept((new_qd, addr))),
-                Err(e) => (qd, OperationResult::Failed(e)),
-            }
-        })
-    }
-
-    /// Coroutine to asynchronously accept an incoming connection.
-    pub async fn accept_coroutine(mut self, qd: QDesc, yielder: Yielder) -> Result<(QDesc, SocketAddrV4), Fail> {
-        // Create queue structure.
-        let mut new_queue: SharedTcpQueue<N> = SharedTcpQueue::<N>::new();
-        // Wait for a new connection on the listening socket.
-        let cb: SharedControlBlock<N> = match self.get_shared_queue(&qd)?.get_mut_socket() {
-            Socket::Listening(socket) => socket.accept(yielder).await?,
-            _ => return Err(Fail::new(libc::EOPNOTSUPP, "socket not listening")),
-        };
-        // Insert queue into queue table and get new queue descriptor.
-        let new_qd: QDesc = self.runtime.alloc_queue::<SharedTcpQueue<N>>(new_queue.clone());
-        // Set up established socket data structure.
-        let established: EstablishedSocket<N> =
-            EstablishedSocket::new(cb, self.dead_socket_tx.clone(), self.runtime.clone())?;
-        let local: SocketAddrV4 = established.cb.get_local();
-        let remote: SocketAddrV4 = established.cb.get_remote();
-        // Set the socket in the new queue to established
-        new_queue.set_socket(Socket::Established(established));
-        // Insert new connection into the backmap of addresses to queues.
-        if self
-            .runtime
-            .insert_socket_id_to_qd(SocketId::Active(local, remote), new_qd)
-            .is_some()
-        {
-            panic!("duplicate queue descriptor in established sockets table");
-        }
-        // TODO: Reset the connection if the following following check fails, instead of panicking.
-        Ok((new_qd, remote))
-    }
-
-    pub fn connect(&mut self, qd: QDesc, remote: SocketAddrV4) -> Pin<Box<Operation>> {
-        let yielder: Yielder = Yielder::new();
-        let peer: Self = self.clone();
-        Box::pin(async move {
-            // Wait for accept to complete.
-            // Handle result: If unsuccessful, free the new queue descriptor.
-            match peer.connect_coroutine(qd, remote, yielder).await {
-                Ok(()) => (qd, OperationResult::Connect),
-                Err(e) => (qd, OperationResult::Failed(e)),
-            }
-        })
-    }
-
-    pub async fn connect_coroutine(mut self, qd: QDesc, remote: SocketAddrV4, yielder: Yielder) -> Result<(), Fail> {
-        // Get local address bound to socket.
+    pub fn accept(&mut self, qd: QDesc) -> Result<QToken, Fail> {
+        #[cfg(feature = "profiler")]
+        timer!("inet::tcp::accept");
+        trace!("accept(): qd={:?}", qd);
         let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-
-        let (socket, local): (SharedActiveOpenSocket<N>, SocketAddrV4) = match queue.get_socket() {
-            Socket::Inactive(local_socket) => {
-                let local: SocketAddrV4 = match local_socket {
-                    Some(local) => local.clone(),
-                    None => {
-                        // TODO: we should free this when closing.
-                        let local_port: u16 = self.runtime.alloc_ephemeral_port()?;
-                        SocketAddrV4::new(self.local_ipv4_addr, local_port)
-                    },
-                };
-                // Create active socket.
-                let local_isn: SeqNumber = self.isn_generator.generate(&local, &remote);
-                (
-                    SharedActiveOpenSocket::new(
-                        local_isn,
-                        local,
-                        remote,
-                        self.runtime.clone(),
-                        self.transport.clone(),
-                        self.tcp_config.clone(),
-                        self.local_link_addr,
-                        self.arp.clone(),
-                    )?,
-                    local,
-                )
-            },
-            Socket::Listening(_) => return Err(Fail::new(libc::EOPNOTSUPP, "socket is listening")),
-            Socket::Connecting(_) => return Err(Fail::new(libc::EALREADY, "socket is connecting")),
-            Socket::Established(_) => return Err(Fail::new(libc::EISCONN, "socket is connected")),
-            Socket::Closing(_) => return Err(Fail::new(libc::EINVAL, "socket is closed")),
+        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
+            // Asynchronous accept code. Clone the self reference and move into the coroutine.
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().accept_coroutine(qd, yielder));
+            // Insert async coroutine into the scheduler.
+            let task_name: String = format!("Catnap::accept for qd={:?}", qd);
+            self.runtime.insert_coroutine(&task_name, coroutine)
         };
-        // Update socket state.
-        queue.set_socket(Socket::Connecting(socket.clone()));
+
+        queue.accept(coroutine_constructor)
+    }
+
+    /// Runs until a new connection is accepted.
+    async fn accept_coroutine(mut self, qd: QDesc, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedTcpQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedTcpQueue<N> = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue.clone(),
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for accept to complete.
+        match queue.accept_coroutine(yielder).await {
+            Ok(new_queue) => {
+                // Handle result: If successful, allocate a new queue.
+                let endpoints: (SocketAddrV4, SocketAddrV4) = match new_queue.endpoints() {
+                    Ok(endpoints) => endpoints,
+                    Err(e) => return (qd, OperationResult::Failed(e)),
+                };
+                let new_qd: QDesc = self.runtime.alloc_queue::<SharedTcpQueue<N>>(new_queue.clone());
+                if let Some(existing_qd) = self
+                    .runtime
+                    .insert_socket_id_to_qd(SocketId::Active(endpoints.0, endpoints.1), new_qd)
+                {
+                    // We should panic here because the ephemeral port allocator should not allocate the same port more than
+                    // once.
+                    unreachable!(
+                        "There is already a queue listening on this queue descriptor {:?}",
+                        existing_qd
+                    );
+                }
+                (qd, OperationResult::Accept((new_qd, endpoints.1)))
+            },
+            Err(e) => (qd, OperationResult::Failed(e)),
+        }
+    }
+
+    /// Sets up the coroutine for connecting the socket to [remote].
+    pub fn connect(&mut self, qd: QDesc, remote: SocketAddrV4) -> Result<QToken, Fail> {
+        #[cfg(feature = "profiler")]
+        timer!("inet::tcp::connect");
+        trace!("connect(): qd={:?} remote={:?}", qd, remote);
+        let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
+        // Check whether we need to allocate an ephemeral port.
+        let local: SocketAddrV4 = match queue.local() {
+            Some(addr) => addr,
+            None => {
+                // TODO: we should free this when closing.
+                // FIXME: https://github.com/microsoft/demikernel/issues/236
+                let local_port: u16 = self.runtime.alloc_ephemeral_port()?;
+                SocketAddrV4::new(self.local_ipv4_addr, local_port)
+            },
+        };
+        // Insert the connection to receive incoming packets for this address pair.
+        // Should we remove the passive entry for the local address if the socket was previously bound?
         if let Some(existing_qd) = self
             .runtime
             .insert_socket_id_to_qd(SocketId::Active(local, remote.clone()), qd)
         {
             // We should panic here because the ephemeral port allocator should not allocate the same port more than
             // once.
-            panic!(
+            unreachable!(
                 "There is already a queue listening on this queue descriptor {:?}",
                 existing_qd
             );
         }
-        let cb: SharedControlBlock<N> = socket.get_result(yielder).await?;
-        let new_socket = Socket::Established(EstablishedSocket::new(
-            cb,
-            self.dead_socket_tx.clone(),
-            self.runtime.clone(),
-        )?);
-        queue.set_socket(new_socket);
-        Ok(())
-    }
-
-    /// TODO: Should probably check for valid queue descriptor before we schedule the future
-    pub fn push(&self, qd: QDesc, buf: DemiBuffer) -> Pin<Box<Operation>> {
-        let result: Result<(), Fail> = match self.get_shared_queue(&qd) {
-            Ok(mut queue) => match queue.get_mut_socket() {
-                Socket::Established(socket) => socket.send(buf),
-                _ => Err(Fail::new(libc::ENOTCONN, "connection not established")),
-            },
-            Err(e) => Err(e),
+        let local_isn: SeqNumber = self.isn_generator.generate(&local, &remote);
+        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
+            // Clone the self reference and move into the coroutine.
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().connect_coroutine(qd, yielder));
+            let task_name: String = format!("inetstack::tcp::connect for qd={:?}", qd);
+            self.runtime.insert_coroutine(&task_name, coroutine)
         };
-        Box::pin(async move {
-            // Wait for accept to complete.
-            // Handle result: If unsuccessful, free the new queue descriptor.
-            match result {
-                Ok(()) => (qd, OperationResult::Push),
-                Err(e) => (qd, OperationResult::Failed(e)),
-            }
-        })
+
+        queue.connect(local, remote, local_isn, coroutine_constructor)
     }
 
-    /// TODO: Should probably check for valid queue descriptor before we schedule the future
-    pub fn pop(&self, qd: QDesc, size: Option<usize>) -> Pin<Box<Operation>> {
-        let yielder: Yielder = Yielder::new();
-        let peer: Self = self.clone();
-        Box::pin(async move {
-            // Wait for accept to complete.
-            // Handle result: If unsuccessful, free the new queue descriptor.
-            match peer.pop_coroutine(qd, size, yielder).await {
-                Ok(buf) => (qd, OperationResult::Pop(None, buf)),
-                Err(e) => (qd, OperationResult::Failed(e)),
-            }
-        })
+    /// Runs until the connect to remote is made or times out.
+    async fn connect_coroutine(mut self, qd: QDesc, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedTcpQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedTcpQueue<N> = match self.runtime.get_shared_queue(&qd) {
+            Ok(queue) => queue,
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        let (local, remote): (SocketAddrV4, SocketAddrV4) = queue
+            .endpoints()
+            .expect("We should have allocated endpoints when we allocated the coroutine");
+        // Wait for connect to complete.
+        match queue.connect_coroutine(yielder).await {
+            Ok(()) => (qd, OperationResult::Connect),
+            Err(e) => {
+                self.runtime.remove_socket_id_to_qd(&SocketId::Active(local, remote));
+                (qd, OperationResult::Failed(e))
+            },
+        }
     }
 
-    pub async fn pop_coroutine(self, qd: QDesc, size: Option<usize>, yielder: Yielder) -> Result<DemiBuffer, Fail> {
+    /// Pushes immediately to the socket and returns the result asynchronously.
+    pub fn push(&mut self, qd: QDesc, buf: DemiBuffer) -> Result<QToken, Fail> {
+        let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
+            // Clone the self reference and move into the coroutine.
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().push_coroutine(qd, yielder));
+            let task_name: String = format!("inetstack::tcp::push for qd={:?}", qd);
+            self.runtime.insert_coroutine(&task_name, coroutine)
+        };
+        queue.push(buf, coroutine_constructor)
+    }
+
+    async fn push_coroutine(self, qd: QDesc, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedTcpQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedTcpQueue<N> = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue,
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for push to complete.
+        match queue.push_coroutine(yielder).await {
+            Ok(()) => (qd, OperationResult::Push),
+            Err(e) => {
+                warn!("push() qd={:?}: {:?}", qd, &e);
+                (qd, OperationResult::Failed(e))
+            },
+        }
+    }
+
+    /// Sets up a coroutine for popping data from the socket.
+    pub fn pop(&mut self, qd: QDesc, size: Option<usize>) -> Result<QToken, Fail> {
         // Get local address bound to socket.
         let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
+            // Clone the self reference and move into the coroutine.
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().pop_coroutine(qd, size, yielder));
+            let task_name: String = format!("inetstack::tcp::pop for qd={:?}", qd);
+            self.runtime.insert_coroutine(&task_name, coroutine)
+        };
+        queue.pop(coroutine_constructor)
+    }
 
-        match queue.get_mut_socket() {
-            Socket::Established(socket) => socket.pop(size, yielder).await,
-            Socket::Closing(_) => Err(Fail::new(libc::EBADF, "socket closing")),
-            Socket::Connecting(_) => Err(Fail::new(libc::EINPROGRESS, "socket connecting")),
-            Socket::Inactive(_) => Err(Fail::new(libc::EBADF, "socket inactive")),
-            Socket::Listening(_) => Err(Fail::new(libc::ENOTCONN, "socket listening")),
+    async fn pop_coroutine(self, qd: QDesc, size: Option<usize>, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedTcpQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedTcpQueue<N> = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue,
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for pop to complete.
+        match queue.pop_coroutine(size, yielder).await {
+            Ok(buf) => (qd, OperationResult::Pop(None, buf)),
+            Err(e) => (qd, OperationResult::Failed(e)),
         }
     }
 
     /// Closes a TCP socket.
     pub fn close(&mut self, qd: QDesc) -> Result<(), Fail> {
+        trace!("Closing socket: qd={:?}", qd);
         // TODO: Currently we do not handle close correctly because we continue to receive packets at this point to finish the TCP close protocol.
         // 1. We do not remove the endpoint from the addresses table
         // 2. We do not remove the queue from the queue table.
         // As a result, we have stale closed queues that are labelled as closing. We should clean these up.
         // look up socket
         let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-
-        let (addr, result): (SocketAddrV4, Result<(), Fail>) = match queue.get_mut_socket() {
-            // Closing an active socket.
-            Socket::Established(socket) => {
-                socket.close()?;
-                // Only using a clone here because we need to read and write the socket.
-                self.get_shared_queue(&qd)?.set_socket(Socket::Closing(socket.clone()));
-                return Ok(());
-            },
-            // Closing an unbound socket.
-            Socket::Inactive(None) => {
-                return Ok(());
-            },
-            // Closing a bound socket.
-            Socket::Inactive(Some(addr)) => (addr.clone(), Ok(())),
-            // Closing a listening socket.
-            Socket::Listening(socket) => {
-                let cause: String = format!("cannot close a listening socket (qd={:?})", qd);
-                error!("do_close(): {}", &cause);
-                (socket.endpoint(), Err(Fail::new(libc::ENOTSUP, &cause)))
-            },
-            // Closing a connecting socket.
-            Socket::Connecting(_) => {
-                let cause: String = format!("cannot close a connecting socket (qd={:?})", qd);
-                error!("do_close(): {}", &cause);
-                return Err(Fail::new(libc::ENOTSUP, &cause));
-            },
-            // Closing a closing socket.
-            Socket::Closing(_) => {
-                let cause: String = format!("cannot close a socket that is closing (qd={:?})", qd);
-                error!("do_close(): {}", &cause);
-                return Err(Fail::new(libc::ENOTSUP, &cause));
-            },
-        };
-
-        // TODO: remove active sockets from the addresses table.
-        match self.runtime.remove_socket_id_to_qd(&SocketId::Passive(addr)) {
-            Some(existing_qd) if existing_qd == qd => {},
-            _ => return Err(Fail::new(libc::EINVAL, "socket id did not map to this qd!")),
-        };
-        result
-    }
-
-    /// Closes a TCP socket.
-    pub fn async_close(&self, qd: QDesc) -> Pin<Box<Operation>> {
-        let yielder: Yielder = Yielder::new();
-        let peer: Self = self.clone();
-        Box::pin(async move {
-            // Wait for accept to complete.
-            // Handle result: If unsuccessful, free the new queue descriptor.
-            match peer.close_coroutine(qd, yielder).await {
-                Ok(()) => (qd, OperationResult::Close),
-                Err(e) => (qd, OperationResult::Failed(e)),
-            }
-        })
-    }
-
-    pub async fn close_coroutine(mut self, qd: QDesc, _: Yielder) -> Result<(), Fail> {
-        let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        match queue.get_mut_socket() {
-            // Closing an active socket.
-            Socket::Established(socket) => {
-                // Send FIN
-                socket.close()?;
-                // Move socket to closing state
-                // Only using a clone here because we need to read and write the socket.
-                self.get_shared_queue(&qd)?.set_socket(Socket::Closing(socket.clone()));
-                // TODO: Wait for the close protocol to finish here.
-                // Remove address from backmap.
-                match self
-                    .runtime
-                    .remove_socket_id_to_qd(&SocketId::Active(socket.endpoints().0, socket.endpoints().1))
-                {
-                    Some(existing_qd) if existing_qd == qd => {},
-                    _ => return Err(Fail::new(libc::EINVAL, "socket id did not map to this qd!")),
-                };
-            },
-            // Closing an unbound socket.
-            Socket::Inactive(None) => {},
-            Socket::Inactive(Some(addr)) => {
-                // Remove address from backmap.
-                match self.runtime.remove_socket_id_to_qd(&SocketId::Passive(addr.clone())) {
-                    Some(existing_qd) if existing_qd == qd => {},
-                    _ => return Err(Fail::new(libc::EINVAL, "socket id did not map to this qd!")),
-                };
-            },
-            // Closing a listening socket.
-            Socket::Listening(_) => {
-                // TODO: Remove this address from the addresses table
-                let cause: String = format!("cannot close a listening socket (qd={:?})", qd);
-                error!("do_close(): {}", &cause);
-                return Err(Fail::new(libc::ENOTSUP, &cause));
-            },
-            // Closing a connecting socket.
-            Socket::Connecting(_) => {
-                let cause: String = format!("cannot close a connecting socket (qd={:?})", qd);
-                error!("do_close(): {}", &cause);
-                return Err(Fail::new(libc::ENOTSUP, &cause));
-            },
-            // Closing a closing socket.
-            Socket::Closing(_) => {
-                let cause: String = format!("cannot close a socket that is closing (qd={:?})", qd);
-                error!("do_close(): {}", &cause);
-                return Err(Fail::new(libc::ENOTSUP, &cause));
-            },
-        };
-        // Free the queue.
-        self.runtime
-            .free_queue::<SharedTcpQueue<N>>(&qd)
-            .expect("queue should exist");
-
+        if let Some(socket_id) = queue.close()? {
+            match self.runtime.remove_socket_id_to_qd(&socket_id) {
+                Some(existing_qd) if existing_qd == qd => {},
+                _ => return Err(Fail::new(libc::EINVAL, "socket id did not map to this qd!")),
+            };
+        }
+        // // Free the queue.
+        // self.runtime
+        //     .free_queue::<SharedTcpQueue<N>>(&qd)
+        //     .expect("queue should exist");
         Ok(())
     }
 
-    pub fn remote_mss(&self, qd: QDesc) -> Result<usize, Fail> {
-        let queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        match queue.get_socket() {
-            Socket::Established(socket) => Ok(socket.remote_mss()),
-            _ => Err(Fail::new(libc::ENOTCONN, "connection not established")),
+    /// Closes a TCP socket.
+    pub fn async_close(&mut self, qd: QDesc) -> Result<QToken, Fail> {
+        trace!("Closing socket: qd={:?}", qd);
+        let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
+        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
+            // Clone the self reference and move into the coroutine.
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().close_coroutine(qd, yielder));
+            let task_name: String = format!("inetstack::tcp::close for qd={:?}", qd);
+            self.runtime.insert_coroutine(&task_name, coroutine)
+        };
+
+        queue.async_close(coroutine_constructor)
+    }
+
+    async fn close_coroutine(mut self, qd: QDesc, yielder: Yielder) -> (QDesc, OperationResult) {
+        // Grab the queue, make sure it hasn't been closed in the meantime.
+        // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
+        // structure and the SharedTcpQueue will not be freed until this coroutine finishes.
+        let mut queue: SharedTcpQueue<N> = match self.get_shared_queue(&qd) {
+            Ok(queue) => queue,
+            Err(e) => return (qd, OperationResult::Failed(e)),
+        };
+        // Wait for close to complete.
+        // Handle result: If unsuccessful, free the new queue descriptor.
+        match queue.close_coroutine(yielder).await {
+            Ok(socket_id) => {
+                if let Some(socket_id) = socket_id {
+                    match self.runtime.remove_socket_id_to_qd(&socket_id) {
+                        Some(existing_qd) if existing_qd == qd => {},
+                        _ => {
+                            return (
+                                qd,
+                                OperationResult::Failed(Fail::new(libc::EINVAL, "socket id did not map to this qd!")),
+                            )
+                        },
+                    }
+                }
+                // Free the queue.
+                self.runtime
+                    .free_queue::<SharedTcpQueue<N>>(&qd)
+                    .expect("queue should exist");
+
+                (qd, OperationResult::Close)
+            },
+            Err(e) => (qd, OperationResult::Failed(e)),
         }
+    }
+
+    pub fn remote_mss(&self, qd: QDesc) -> Result<usize, Fail> {
+        self.get_shared_queue(&qd)?.remote_mss()
     }
 
     pub fn current_rto(&self, qd: QDesc) -> Result<Duration, Fail> {
-        let queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        match queue.get_socket() {
-            Socket::Established(socket) => Ok(socket.current_rto()),
-            _ => return Err(Fail::new(libc::ENOTCONN, "connection not established")),
-        }
+        self.get_shared_queue(&qd)?.current_rto()
     }
 
     pub fn endpoints(&self, qd: QDesc) -> Result<(SocketAddrV4, SocketAddrV4), Fail> {
-        let queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        match queue.get_socket() {
-            Socket::Established(socket) => Ok(socket.endpoints()),
-            _ => Err(Fail::new(libc::ENOTCONN, "connection not established")),
-        }
+        self.get_shared_queue(&qd)?.endpoints()
     }
 
     fn get_shared_queue(&self, qd: &QDesc) -> Result<SharedTcpQueue<N>, Fail> {
@@ -589,105 +488,8 @@ impl<const N: usize> SharedTcpPeer<N> {
         };
 
         // Dispatch to further processing depending on the socket state.
-        // It is safe to call expect() here because qd must be on the queue table.
-        let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        match queue.get_mut_socket() {
-            Socket::Established(socket) => {
-                debug!("Routing to established connection: {:?}", socket.endpoints());
-                socket.receive(&mut tcp_hdr, data);
-                return Ok(());
-            },
-            Socket::Connecting(socket) => {
-                debug!("Routing to connecting connection: {:?}", socket.endpoints());
-                socket.receive(&tcp_hdr);
-                return Ok(());
-            },
-            Socket::Listening(socket) => {
-                debug!("Routing to passive connection: {:?}", local);
-                match socket.receive(ip_hdr, &tcp_hdr) {
-                    Ok(()) => return Ok(()),
-                    // Connection was refused.
-                    Err(e) if e.errno == libc::ECONNREFUSED => {
-                        // Fall through and send a RST segment back.
-                    },
-                    Err(e) => return Err(e),
-                }
-            },
-            // The segment is for an inactive connection.
-            Socket::Inactive(_) => {
-                debug!("Routing to inactive connection: {:?}", local);
-                // Fall through and send a RST segment back.
-            },
-            Socket::Closing(socket) => {
-                debug!("Routing to closing connection: {:?}", socket.endpoints());
-                socket.receive(&mut tcp_hdr, data);
-                return Ok(());
-            },
-        }
-
-        // Generate the RST segment accordingly to the ACK field.
-        // If the incoming segment has an ACK field, the reset takes its
-        // sequence number from the ACK field of the segment, otherwise the
-        // reset has sequence number zero and the ACK field is set to the sum
-        // of the sequence number and segment length of the incoming segment.
-        // Reference: https://datatracker.ietf.org/doc/html/rfc793#section-3.4
-        let (seq_num, ack_num): (SeqNumber, Option<SeqNumber>) = if tcp_hdr.ack {
-            (tcp_hdr.ack_num, None)
-        } else {
-            (
-                SeqNumber::from(0),
-                Some(tcp_hdr.seq_num + SeqNumber::from(tcp_hdr.compute_size() as u32)),
-            )
-        };
-
-        debug!("receive(): sending RST (local={:?}, remote={:?})", local, remote);
-        self.send_rst(&local, &remote, seq_num, ack_num)?;
-        Ok(())
-    }
-
-    /// Sends a RST segment from `local` to `remote`.
-    pub fn send_rst(
-        &mut self,
-        local: &SocketAddrV4,
-        remote: &SocketAddrV4,
-        seq_num: SeqNumber,
-        ack_num: Option<SeqNumber>,
-    ) -> Result<(), Fail> {
-        // Query link address for destination.
-        let dst_link_addr: MacAddress = match self.arp.try_query(remote.ip().clone()) {
-            Some(link_addr) => link_addr,
-            None => {
-                // ARP query is unlikely to fail, but if it does, don't send the RST segment,
-                // and return an error to server side.
-                let cause: String = format!("missing ARP entry (remote={})", remote.ip());
-                error!("send_rst(): {}", &cause);
-                return Err(Fail::new(libc::EHOSTUNREACH, &cause));
-            },
-        };
-
-        // Create a RST segment.
-        let segment: TcpSegment = {
-            let mut tcp_hdr: TcpHeader = TcpHeader::new(local.port(), remote.port());
-            tcp_hdr.rst = true;
-            tcp_hdr.seq_num = seq_num;
-            if let Some(ack_num) = ack_num {
-                tcp_hdr.ack = true;
-                tcp_hdr.ack_num = ack_num;
-            }
-            TcpSegment {
-                ethernet2_hdr: Ethernet2Header::new(dst_link_addr, self.local_link_addr, EtherType2::Ipv4),
-                ipv4_hdr: Ipv4Header::new(local.ip().clone(), remote.ip().clone(), IpProtocol::TCP),
-                tcp_hdr,
-                data: None,
-                tx_checksum_offload: self.tcp_config.get_rx_checksum_offload(),
-            }
-        };
-
-        // Send it.
-        let pkt: Box<TcpSegment> = Box::new(segment);
-        self.transport.transmit(pkt);
-
-        Ok(())
+        self.get_shared_queue(&qd)?
+            .receive(&ip_hdr, &mut tcp_hdr, &local, &remote, data)
     }
 }
 

@@ -26,6 +26,7 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
+        scheduler::TaskHandle,
         types::{
             demi_qresult_t,
             demi_sgarray_t,
@@ -35,7 +36,6 @@ use crate::{
         SharedBox,
         SharedDemiRuntime,
     },
-    scheduler::TaskHandle,
 };
 use ::std::{
     net::{
@@ -118,9 +118,7 @@ impl CatnipLibOS {
                     return Err(Fail::new(libc::EINVAL, "zero-length buffer"));
                 }
 
-                let handle: TaskHandle = self.do_push(qd, buf)?;
-                let qt: QToken = handle.get_task_id().into();
-                Ok(qt)
+                self.do_push(qd, buf)
             },
             Err(e) => Err(e),
         }

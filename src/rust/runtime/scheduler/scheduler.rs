@@ -11,18 +11,20 @@
 // Imports
 //======================================================================================================================
 
-use crate::scheduler::{
-    page::{
-        WakerPageRef,
-        WakerRef,
+use crate::{
+    collections::pin_slab::PinSlab,
+    runtime::scheduler::{
+        page::{
+            WakerPageRef,
+            WakerRef,
+        },
+        waker64::{
+            WAKER_BIT_LENGTH,
+            WAKER_BIT_LENGTH_SHIFT,
+        },
+        Task,
+        TaskHandle,
     },
-    pin_slab::PinSlab,
-    waker64::{
-        WAKER_BIT_LENGTH,
-        WAKER_BIT_LENGTH_SHIFT,
-    },
-    Task,
-    TaskHandle,
 };
 use ::bit_iter::BitIter;
 use ::rand::{
@@ -269,7 +271,7 @@ impl Default for Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use crate::scheduler::{
+    use crate::runtime::scheduler::{
         scheduler::{
             Scheduler,
             TaskHandle,

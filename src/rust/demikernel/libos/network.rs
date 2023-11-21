@@ -9,6 +9,7 @@ use crate::{
     pal::constants::SOMAXCONN,
     runtime::{
         fail::Fail,
+        scheduler::TaskHandle,
         types::{
             demi_qresult_t,
             demi_sgarray_t,
@@ -16,7 +17,6 @@ use crate::{
         QDesc,
         QToken,
     },
-    scheduler::TaskHandle,
 };
 use ::std::net::SocketAddr;
 
@@ -66,7 +66,7 @@ impl NetworkLibOS {
             #[cfg(feature = "catpowder-libos")]
             NetworkLibOS::Catpowder(libos) => libos.socket(domain, socket_type, protocol),
             #[cfg(all(feature = "catnap-libos"))]
-            NetworkLibOS::Catnap(libos) => libos.socket(domain, socket_type, protocol),
+            NetworkLibOS::Catnap(libos) => libos.socket(domain.into(), socket_type.into(), protocol.into()),
             #[cfg(feature = "catcollar-libos")]
             NetworkLibOS::Catcollar(libos) => libos.socket(domain, socket_type, protocol),
             #[cfg(feature = "catnip-libos")]

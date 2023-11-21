@@ -23,8 +23,10 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
+        scheduler::Yielder,
         Operation,
         QDesc,
+        QToken,
         SharedBox,
         SharedObject,
     },
@@ -109,14 +111,14 @@ impl<const N: usize> SharedEngine<N> {
         self.ipv4.ping(dest_ipv4_addr, timeout).await
     }
 
-    pub fn udp_pushto(&self, qd: QDesc, buf: DemiBuffer, to: SocketAddrV4) -> Result<(), Fail> {
+    pub fn udp_pushto(&self, qd: QDesc, buf: DemiBuffer, to: SocketAddrV4) -> Result<Pin<Box<Operation>>, Fail> {
         let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
         udp.pushto(qd, buf, to)
     }
 
-    pub fn udp_pop(&self, qd: QDesc) -> Pin<Box<Operation>> {
+    pub fn udp_pop(&self, qd: QDesc) -> Result<Pin<Box<Operation>>, Fail> {
         let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
-        Box::pin(async move { udp.pop_coroutine(qd, None).await })
+        udp.pop(qd, None)
     }
 
     pub fn udp_socket(&mut self) -> Result<QDesc, Fail> {
@@ -135,7 +137,7 @@ impl<const N: usize> SharedEngine<N> {
         self.ipv4.tcp.socket()
     }
 
-    pub fn tcp_connect(&mut self, socket_fd: QDesc, remote_endpoint: SocketAddrV4) -> Pin<Box<Operation>> {
+    pub fn tcp_connect(&mut self, socket_fd: QDesc, remote_endpoint: SocketAddrV4) -> Result<QToken, Fail> {
         self.ipv4.tcp.connect(socket_fd, remote_endpoint)
     }
 
@@ -143,15 +145,15 @@ impl<const N: usize> SharedEngine<N> {
         self.ipv4.tcp.bind(socket_fd, endpoint)
     }
 
-    pub fn tcp_accept(&self, fd: QDesc) -> Pin<Box<Operation>> {
+    pub fn tcp_accept(&mut self, fd: QDesc) -> Result<QToken, Fail> {
         self.ipv4.tcp.accept(fd)
     }
 
-    pub fn tcp_push(&mut self, socket_fd: QDesc, buf: DemiBuffer) -> Pin<Box<Operation>> {
+    pub fn tcp_push(&mut self, socket_fd: QDesc, buf: DemiBuffer) -> Result<QToken, Fail> {
         self.ipv4.tcp.push(socket_fd, buf)
     }
 
-    pub fn tcp_pop(&mut self, socket_fd: QDesc) -> Pin<Box<Operation>> {
+    pub fn tcp_pop(&mut self, socket_fd: QDesc) -> Result<QToken, Fail> {
         self.ipv4.tcp.pop(socket_fd, None)
     }
 
@@ -164,7 +166,7 @@ impl<const N: usize> SharedEngine<N> {
     }
 
     pub async fn arp_query(&mut self, ipv4_addr: Ipv4Addr) -> Result<MacAddress, Fail> {
-        self.arp.query(ipv4_addr).await
+        self.arp.query(ipv4_addr, &Yielder::new()).await
     }
 
     pub fn tcp_mss(&self, handle: QDesc) -> Result<usize, Fail> {

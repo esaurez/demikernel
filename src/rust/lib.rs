@@ -18,8 +18,6 @@ pub mod pal;
 #[cfg(feature = "profiler")]
 pub mod perftools;
 
-pub mod scheduler;
-
 pub mod runtime;
 
 pub mod inetstack;

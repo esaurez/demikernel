@@ -19,6 +19,10 @@ use crate::{
             QDesc,
             QToken,
         },
+        scheduler::{
+            TaskHandle,
+            Yielder,
+        },
         types::{
             demi_opcode_t,
             demi_qresult_t,
@@ -26,16 +30,13 @@ use crate::{
         },
         OperationResult,
     },
-    scheduler::{
-        TaskHandle,
-        Yielder,
-    },
 };
 use ::rand::{
     rngs::SmallRng,
     RngCore,
     SeedableRng,
 };
+use ::socket2::Type;
 use ::std::{
     collections::HashSet,
     mem,
@@ -92,7 +93,7 @@ impl Socket {
     /// Creates a new socket that is not bound to an address.
     pub fn new(catmem: SharedCatmemLibOS) -> Result<Self, Fail> {
         Ok(Self {
-            state: SocketStateMachine::new_unbound(libc::SOCK_STREAM),
+            state: SocketStateMachine::new_unbound(Type::STREAM),
             catmem,
             catmem_qd: None,
             local: None,
@@ -475,7 +476,7 @@ async fn pop_request_id(
 
     // Parse and check request.
     let result: Result<RequestId, Fail> = get_connect_id(&sga);
-    catmem.free_sgarray(sga)?;
+    catmem.sgafree(sga)?;
     result
 }
 
@@ -493,7 +494,7 @@ async fn create_pipe(
     // to open the duplex pipe before it is created.
     let new_qd: QDesc = catmem.create_pipe(&format_pipe_str(ipv4, port))?;
     // Allocate a scatter-gather array and send the port number to the remote.
-    let sga: demi_sgarray_t = catmem.alloc_sgarray(mem::size_of_val(&port))?;
+    let sga: demi_sgarray_t = catmem.sgaalloc(mem::size_of_val(&port))?;
     let ptr: *mut u8 = sga.sga_segs[0].sgaseg_buf as *mut u8;
     let len: usize = sga.sga_segs[0].sgaseg_len as usize;
     let slice: &mut [u8] = unsafe { slice::from_raw_parts_mut(ptr, len) };
@@ -513,7 +514,7 @@ async fn create_pipe(
         }
     }
     // Free the scatter-gather array.
-    catmem.free_sgarray(sga)?;
+    catmem.sgafree(sga)?;
 
     // Retrieve operation result and check if it is what we expect.
     let qr: demi_qresult_t = catmem.pack_result(handle, qt)?;
@@ -562,7 +563,7 @@ async fn send_connection_request(
         }
     }
     // Free the message buffer.
-    catmem.free_sgarray(sga)?;
+    catmem.sgafree(sga)?;
     // Get the result of the push.
     let qr: demi_qresult_t = catmem.pack_result(handle, qt)?;
     match qr.qr_opcode {
@@ -643,7 +644,7 @@ async fn get_port(
 
                     // Extract port number.
                     let port: Result<u16, Fail> = extract_port_number(&sga);
-                    catmem.free_sgarray(sga)?;
+                    catmem.sgafree(sga)?;
                     return port;
                 },
                 // We may get some error.
@@ -693,7 +694,7 @@ async fn send_ack(
         }
     }
     // Free the message buffer.
-    catmem.free_sgarray(sga)?;
+    catmem.sgafree(sga)?;
     // Retrieve operation result and check if it is what we expect.
     let qr: demi_qresult_t = catmem.pack_result(handle, qt)?;
 
@@ -720,7 +721,7 @@ async fn send_ack(
 
 /// Creates a magic connect message.
 pub fn send_connect_id(catmem: &mut SharedCatmemLibOS, request_id: &RequestId) -> Result<demi_sgarray_t, Fail> {
-    let sga: demi_sgarray_t = catmem.alloc_sgarray(mem::size_of_val(&request_id))?;
+    let sga: demi_sgarray_t = catmem.sgaalloc(mem::size_of_val(&request_id))?;
     let ptr: *mut u64 = sga.sga_segs[0].sgaseg_buf as *mut u64;
     unsafe {
         *ptr = request_id.0;

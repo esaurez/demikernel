@@ -12,10 +12,7 @@ use crate::{
             EtherType2,
             Ethernet2Header,
         },
-        udp::{
-            queue::SharedUdpQueue,
-            SharedUdpPeer,
-        },
+        udp::queue::SharedUdpQueue,
         Peer,
     },
     pal::constants::{
@@ -45,10 +42,10 @@ use crate::{
             QToken,
             QType,
         },
+        scheduler::TaskHandle,
         SharedBox,
         SharedDemiRuntime,
     },
-    scheduler::TaskHandle,
 };
 use ::libc::c_int;
 use ::std::{
@@ -252,12 +249,7 @@ impl<const N: usize> InetStack<N> {
 
         // Search for target queue descriptor.
         match self.runtime.get_queue_type(&qd)? {
-            QType::TcpSocket => {
-                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.accept(qd);
-                let task_id: String = format!("Inetstack::TCP::accept for qd={:?}", qd);
-                let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
-                Ok(handle.get_task_id().into())
-            },
+            QType::TcpSocket => self.ipv4.tcp.accept(qd),
             // This queue descriptor does not concern a TCP socket.
             _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
         }
@@ -284,12 +276,7 @@ impl<const N: usize> InetStack<N> {
         let remote: SocketAddrV4 = unwrap_socketaddr(remote)?;
 
         match self.runtime.get_queue_type(&qd)? {
-            QType::TcpSocket => {
-                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.connect(qd, remote);
-                let task_id: String = format!("Inetstack::TCP::connect for qd={:?}", qd);
-                let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
-                Ok(handle.get_task_id().into())
-            },
+            QType::TcpSocket => self.ipv4.tcp.connect(qd, remote),
             _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
         }
     }
@@ -331,12 +318,8 @@ impl<const N: usize> InetStack<N> {
         timer!("inetstack::async_close");
         trace!("async_close(): qd={:?}", qd);
 
-        let (task_id, coroutine): (String, Pin<Box<Operation>>) = match self.runtime.get_queue_type(&qd)? {
-            QType::TcpSocket => {
-                let task_id: String = format!("Inetstack::TCP::close for qd={:?}", qd);
-                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.async_close(qd);
-                (task_id, coroutine)
-            },
+        match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => self.ipv4.tcp.async_close(qd),
             QType::UdpSocket => {
                 self.ipv4.udp.close(qd)?;
                 let task_id: String = format!("Inetstack::UDP::close for qd={:?}", qd);
@@ -349,26 +332,20 @@ impl<const N: usize> InetStack<N> {
                         .expect("queue should exist");
                     (qd, OperationResult::Close)
                 });
-                (task_id, coroutine)
+                let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
+                let qt: QToken = handle.get_task_id().into();
+                trace!("async_close() qt={:?}", qt);
+                Ok(qt)
             },
-            _ => return Err(Fail::new(libc::EINVAL, "invalid queue type")),
-        };
-
-        let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
-        let qt: QToken = handle.get_task_id().into();
-        trace!("async_close() qt={:?}", qt);
-        Ok(qt)
+            _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
+        }
     }
 
     /// Pushes a buffer to a TCP socket.
     /// TODO: Rename this function to push() once we have a common representation across all libOSes.
-    pub fn do_push(&mut self, qd: QDesc, buf: DemiBuffer) -> Result<TaskHandle, Fail> {
+    pub fn do_push(&mut self, qd: QDesc, buf: DemiBuffer) -> Result<QToken, Fail> {
         match self.runtime.get_queue_type(&qd)? {
-            QType::TcpSocket => {
-                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.push(qd, buf);
-                let task_id: String = format!("Inetstack::TCP::push for qd={:?}", qd);
-                self.runtime.insert_coroutine(task_id.as_str(), coroutine)
-            },
+            QType::TcpSocket => self.ipv4.tcp.push(qd, buf),
             _ => Err(Fail::new(libc::EINVAL, "invalid queue type")),
         }
     }
@@ -387,10 +364,7 @@ impl<const N: usize> InetStack<N> {
         }
 
         // Issue operation.
-        let handle: TaskHandle = self.do_push(qd, buf)?;
-        let qt: QToken = handle.get_task_id().into();
-        trace!("push2() qt={:?}", qt);
-        Ok(qt)
+        self.do_push(qd, buf)
     }
 
     /// Pushes a buffer to a UDP socket.
@@ -401,8 +375,7 @@ impl<const N: usize> InetStack<N> {
 
         match self.runtime.get_queue_type(&qd)? {
             QType::UdpSocket => {
-                self.ipv4.udp.pushto(qd, buf, to)?;
-                let coroutine: Pin<Box<Operation>> = Box::pin(async move { (qd, OperationResult::Push) });
+                let coroutine: Pin<Box<Operation>> = self.ipv4.udp.pushto(qd, buf, to)?;
                 let task_id: String = format!("Inetstack::UDP::pushto for qd={:?}", qd);
                 self.runtime.insert_coroutine(task_id.as_str(), coroutine)
             },
@@ -440,25 +413,18 @@ impl<const N: usize> InetStack<N> {
         // We just assert 'size' here, because it was previously checked at PDPIX layer.
         debug_assert!(size.is_none() || ((size.unwrap() > 0) && (size.unwrap() <= limits::POP_SIZE_MAX)));
 
-        let (task_id, coroutine): (String, Pin<Box<Operation>>) = match self.runtime.get_queue_type(&qd)? {
-            QType::TcpSocket => {
-                let task_id: String = format!("Inetstack::TCP::pop for qd={:?}", qd);
-                let coroutine: Pin<Box<Operation>> = self.ipv4.tcp.pop(qd, size);
-                (task_id, coroutine)
-            },
+        match self.runtime.get_queue_type(&qd)? {
+            QType::TcpSocket => self.ipv4.tcp.pop(qd, size),
             QType::UdpSocket => {
                 let task_id: String = format!("Inetstack::UDP::pop for qd={:?}", qd);
-                let mut udp: SharedUdpPeer<N> = self.ipv4.udp.clone();
-                let coroutine: Pin<Box<Operation>> = Box::pin(async move { udp.pop_coroutine(qd, size).await });
-                (task_id, coroutine)
+                let coroutine: Pin<Box<Operation>> = self.ipv4.udp.pop(qd, size)?;
+                let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
+                let qt: QToken = handle.get_task_id().into();
+                trace!("async_close() qt={:?}", qt);
+                Ok(qt)
             },
             _ => return Err(Fail::new(libc::EINVAL, "invalid queue type")),
-        };
-
-        let handle: TaskHandle = self.runtime.insert_coroutine(task_id.as_str(), coroutine)?;
-        let qt: QToken = handle.get_task_id().into();
-        trace!("pop() qt={:?}", qt);
-        Ok(qt)
+        }
     }
 
     /// Waits for an operation to complete.

@@ -11,6 +11,7 @@ pub mod logging;
 pub mod memory;
 pub mod network;
 pub mod queue;
+pub mod scheduler;
 pub mod timer;
 pub mod types;
 pub mod watched;
@@ -48,13 +49,13 @@ use crate::{
             IoQueue,
             IoQueueTable,
         },
+        scheduler::{
+            Scheduler,
+            Task,
+            TaskHandle,
+        },
         timer::SharedTimer,
         types::demi_opcode_t,
-    },
-    scheduler::{
-        scheduler::Scheduler,
-        Task,
-        TaskHandle,
     },
 };
 use ::std::{
@@ -174,6 +175,11 @@ impl SharedDemiRuntime {
         // 2. Cast to void and then downcast to operation task.
         trace!("Removing coroutine: {:?}", boxed_task.get_name());
         OperationTask::from(boxed_task.as_any())
+    }
+
+    /// Removes a coroutine from the underlying scheduler given its associated [QToken] `qt`.
+    pub fn remove_coroutine_with_qtoken(&mut self, qt: QToken) -> OperationTask {
+        self.remove_coroutine(&self.scheduler.from_task_id(qt.into()).expect("coroutine should exist"))
     }
 
     /// Removes a coroutine from the underlying scheduler given its associated [TaskHandle] `handle`
