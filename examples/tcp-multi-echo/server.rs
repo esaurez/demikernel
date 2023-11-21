@@ -94,7 +94,7 @@ impl TcpEchoServer {
     }
 
     /// Runs the target TCP echo server.
-    pub fn run(&mut self, log_interval: Option<u64>) -> Result<()> {
+    pub fn run(&mut self, log_interval: Option<u64>, niterations: usize) -> Result<()> {
         let mut last_log: Instant = Instant::now();
 
         // Accept first connection.
@@ -107,40 +107,41 @@ impl TcpEchoServer {
             self.handle_accept(&qr)?;
         }
 
-        loop {
-            // Stop: all clients disconnected.
-            if self.clients.len() == 0 {
-                println!("INFO: stopping...");
-                break;
-            }
+        for iter in 0..niterations {
+            loop {
+                // Dump statistics.
+                if let Some(log_interval) = log_interval {
+                    if last_log.elapsed() > Duration::from_secs(log_interval) {
+                        println!("INFO: {:?} clients connected", self.clients.len(),);
+                        last_log = Instant::now();
+                    }
+                }
 
-            // Dump statistics.
-            if let Some(log_interval) = log_interval {
-                if last_log.elapsed() > Duration::from_secs(log_interval) {
-                    println!("INFO: {:?} clients connected", self.clients.len(),);
-                    last_log = Instant::now();
+                // Wait for any operation to complete.
+                let qr: demi_qresult_t = {
+                    let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
+                    self.unregister_operation(index)?;
+                    qr
+                };
+
+                // Parse result.
+                match qr.qr_opcode {
+                    demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_accept(&qr)?,
+                    demi_opcode_t::DEMI_OPC_POP => self.handle_pop(&qr)?,
+                    demi_opcode_t::DEMI_OPC_PUSH => self.handle_push()?,
+                    demi_opcode_t::DEMI_OPC_FAILED => self.handle_fail(&qr)?,
+                    demi_opcode_t::DEMI_OPC_INVALID => self.handle_unexpected("invalid", &qr)?,
+                    demi_opcode_t::DEMI_OPC_CLOSE => self.handle_unexpected("close", &qr)?,
+                    demi_opcode_t::DEMI_OPC_CONNECT => self.handle_unexpected("connect", &qr)?,
+                }
+
+                // Stop: all clients disconnected.
+                if self.clients.len() == 0 {
+                    println!("INFO: stopping iteration {} ...", iter);
+                    break;
                 }
             }
-
-            // Wait for any operation to complete.
-            let qr: demi_qresult_t = {
-                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
-                self.unregister_operation(index)?;
-                qr
-            };
-
-            // Parse result.
-            match qr.qr_opcode {
-                demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_accept(&qr)?,
-                demi_opcode_t::DEMI_OPC_POP => self.handle_pop(&qr)?,
-                demi_opcode_t::DEMI_OPC_PUSH => self.handle_push()?,
-                demi_opcode_t::DEMI_OPC_FAILED => self.handle_fail(&qr)?,
-                demi_opcode_t::DEMI_OPC_INVALID => self.handle_unexpected("invalid", &qr)?,
-                demi_opcode_t::DEMI_OPC_CLOSE => self.handle_unexpected("close", &qr)?,
-                demi_opcode_t::DEMI_OPC_CONNECT => self.handle_unexpected("connect", &qr)?,
-            }
         }
-
         Ok(())
     }
 
