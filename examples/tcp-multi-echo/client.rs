@@ -95,6 +95,7 @@ impl TcpEchoClient {
         let start: Instant = Instant::now();
         let mut last_log: Instant = Instant::now();
         for _ in 0..niterations {
+            self.nechoed = 0;
             // Open all connections.
             for _ in 0..nclients {
                 let sockqd: QDesc = self.libos.socket(AF_INET, SOCK_STREAM, 0)?;
@@ -111,11 +112,6 @@ impl TcpEchoClient {
                     if self.nechoed >= nrequests {
                         break;
                     }
-                }
-
-                // Stop: all clients ere disconnected.
-                if self.clients.len() == 0 {
-                    break;
                 }
 
                 // Dump statistics.
@@ -143,11 +139,17 @@ impl TcpEchoClient {
                     demi_opcode_t::DEMI_OPC_INVALID => self.handle_unexpected("invalid", &qr)?,
                     demi_opcode_t::DEMI_OPC_CLOSE => self.handle_unexpected("close", &qr)?,
                     demi_opcode_t::DEMI_OPC_CONNECT => {
+                        println!("INFO: Client connected");
                         // Push first request.
                         let sockqd: QDesc = qr.qr_qd.into();
                         self.issue_push(sockqd)?;
                     },
                     demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_unexpected("accept", &qr)?,
+                }
+
+                // Stop: all clients ere disconnected.
+                if self.clients.len() == 0 {
+                    break;
                 }
             }
 
