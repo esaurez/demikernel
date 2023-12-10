@@ -7,6 +7,8 @@
 
 pub mod established;
 pub mod setup;
+#[cfg(debug_assertions)]
+mod simulator;
 
 //======================================================================================================================
 // Imports

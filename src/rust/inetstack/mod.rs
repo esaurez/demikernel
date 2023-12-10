@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//==============================================================================
+//======================================================================================================================
 // Imports
-//==============================================================================
+//======================================================================================================================
 
 use crate::{
     inetstack::protocols::{
@@ -42,9 +42,13 @@ use crate::{
             QToken,
             QType,
         },
-        scheduler::TaskHandle,
+        scheduler::{
+            TaskHandle,
+            Yielder,
+        },
         SharedBox,
         SharedDemiRuntime,
+        SharedObject,
     },
 };
 use ::libc::c_int;
@@ -54,16 +58,19 @@ use ::std::{
         SocketAddr,
         SocketAddrV4,
     },
+    ops::{
+        Deref,
+        DerefMut,
+    },
     pin::Pin,
-    time::Instant,
 };
 
 #[cfg(feature = "profiler")]
 use crate::timer;
 
-//==============================================================================
+//======================================================================================================================
 // Exports
-//==============================================================================
+//======================================================================================================================
 
 #[cfg(test)]
 pub mod test_helpers;
@@ -76,7 +83,6 @@ pub mod protocols;
 // Constants
 //======================================================================================================================
 
-const TIMER_RESOLUTION: usize = 64;
 const MAX_RECV_ITERS: usize = 2;
 
 //======================================================================================================================
@@ -89,12 +95,18 @@ pub struct InetStack<const N: usize> {
     runtime: SharedDemiRuntime,
     transport: SharedBox<dyn NetworkRuntime<N>>,
     local_link_addr: MacAddress,
-    ts_iters: usize,
 }
 
-impl<const N: usize> InetStack<N> {
+#[derive(Clone)]
+pub struct SharedInetStack<const N: usize>(SharedObject<InetStack<N>>);
+
+//======================================================================================================================
+// Associated Functions
+//======================================================================================================================
+
+impl<const N: usize> SharedInetStack<N> {
     pub fn new(
-        runtime: SharedDemiRuntime,
+        mut runtime: SharedDemiRuntime,
         transport: SharedBox<dyn NetworkRuntime<N>>,
         local_link_addr: MacAddress,
         local_ipv4_addr: Ipv4Addr,
@@ -120,19 +132,18 @@ impl<const N: usize> InetStack<N> {
             arp.clone(),
             rng_seed,
         )?;
-        Ok(Self {
+        let me: Self = Self(SharedObject::<InetStack<N>>::new(InetStack {
             arp,
             ipv4,
-            runtime,
+            runtime: runtime.clone(),
             transport,
             local_link_addr,
-            ts_iters: 0,
-        })
+        }));
+        let yielder: Yielder = Yielder::new();
+        let background_task: String = format!("inetstack::poll_recv");
+        runtime.insert_background_coroutine(&background_task, Box::pin(me.clone().poll_recv(yielder)))?;
+        Ok(me)
     }
-
-    //======================================================================================================================
-    // Associated Functions
-    //======================================================================================================================
 
     ///
     /// **Brief**
@@ -154,8 +165,6 @@ impl<const N: usize> InetStack<N> {
     /// socket is returned. Upon failure, `Fail` is returned instead.
     ///
     pub fn socket(&mut self, domain: c_int, socket_type: c_int, _protocol: c_int) -> Result<QDesc, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::socket");
         trace!(
             "socket(): domain={:?} type={:?} protocol={:?}",
             domain,
@@ -184,8 +193,6 @@ impl<const N: usize> InetStack<N> {
     /// returned instead.
     ///
     pub fn bind(&mut self, qd: QDesc, local: SocketAddr) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::bind");
         trace!("bind(): qd={:?} local={:?}", qd, local);
 
         // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
@@ -215,8 +222,6 @@ impl<const N: usize> InetStack<N> {
     /// returned instead.
     ///
     pub fn listen(&mut self, qd: QDesc, backlog: usize) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::listen");
         trace!("listen() qd={:?}, backlog={:?}", qd, backlog);
 
         // FIXME: https://github.com/demikernel/demikernel/issues/584
@@ -243,8 +248,6 @@ impl<const N: usize> InetStack<N> {
     /// returned instead.
     ///
     pub fn accept(&mut self, qd: QDesc) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::accept");
         trace!("accept(): {:?}", qd);
 
         // Search for target queue descriptor.
@@ -268,8 +271,6 @@ impl<const N: usize> InetStack<N> {
     /// returned instead.
     ///
     pub fn connect(&mut self, qd: QDesc, remote: SocketAddr) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::connect");
         trace!("connect(): qd={:?} remote={:?}", qd, remote);
 
         // FIXME: add IPv6 support; https://github.com/microsoft/demikernel/issues/935
@@ -292,8 +293,6 @@ impl<const N: usize> InetStack<N> {
     /// returned instead.
     ///
     pub fn close(&mut self, qd: QDesc) -> Result<(), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::close");
         trace!("close(): qd={:?}", qd);
 
         match self.runtime.get_queue_type(&qd)? {
@@ -314,8 +313,6 @@ impl<const N: usize> InetStack<N> {
     /// completes shutting down the connection. Upon failure, `Fail` is returned instead.
     ///
     pub fn async_close(&mut self, qd: QDesc) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::async_close");
         trace!("async_close(): qd={:?}", qd);
 
         match self.runtime.get_queue_type(&qd)? {
@@ -353,8 +350,6 @@ impl<const N: usize> InetStack<N> {
     /// Pushes raw data to a TCP socket.
     /// TODO: Move this function to demikernel repo once we have a common buffer representation across all libOSes.
     pub fn push2(&mut self, qd: QDesc, data: &[u8]) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::push2");
         trace!("push2(): qd={:?}", qd);
 
         // Convert raw data to a buffer representation.
@@ -386,8 +381,6 @@ impl<const N: usize> InetStack<N> {
     /// Pushes raw data to a UDP socket.
     /// TODO: Move this function to demikernel repo once we have a common buffer representation across all libOSes.
     pub fn pushto2(&mut self, qd: QDesc, data: &[u8], remote: SocketAddr) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::pushto2");
         trace!("pushto2(): qd={:?}", qd);
 
         // Convert raw data to a buffer representation.
@@ -405,9 +398,6 @@ impl<const N: usize> InetStack<N> {
     /// Create a pop request to write data from IO connection represented by `qd` into a buffer
     /// allocated by the application.
     pub fn pop(&mut self, qd: QDesc, size: Option<usize>) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::pop");
-
         trace!("pop() qd={:?}, size={:?}", qd, size);
 
         // We just assert 'size' here, because it was previously checked at PDPIX layer.
@@ -431,8 +421,6 @@ impl<const N: usize> InetStack<N> {
     /// This function is deprecated, do not use.
     /// FIXME: https://github.com/microsoft/demikernel/issues/889
     pub fn wait2(&mut self, qt: QToken) -> Result<(QDesc, OperationResult), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::wait2");
         trace!("wait2(): qt={:?}", qt);
 
         // Retrieve associated schedule handle.
@@ -440,7 +428,7 @@ impl<const N: usize> InetStack<N> {
 
         loop {
             // Poll first, so as to give pending operations a chance to complete.
-            self.poll_bg_work();
+            self.poll();
 
             // The operation has completed, so extract the result and return.
             if handle.has_completed() {
@@ -454,13 +442,11 @@ impl<const N: usize> InetStack<N> {
     /// This function is deprecated, do not use.
     /// FIXME: https://github.com/microsoft/demikernel/issues/890
     pub fn wait_any2(&mut self, qts: &[QToken]) -> Result<(usize, QDesc, OperationResult), Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inetstack::wait_any2");
         trace!("wait_any2(): qts={:?}", qts);
 
         loop {
             // Poll first, so as to give pending operations a chance to complete.
-            self.poll_bg_work();
+            self.poll();
 
             // Search for any operation that has completed.
             for (i, &qt) in qts.iter().enumerate() {
@@ -510,19 +496,10 @@ impl<const N: usize> InetStack<N> {
     /// Scheduler will poll all futures that are ready to make progress.
     /// Then ask the runtime to receive new data which we will forward to the engine to parse and
     /// route to the correct protocol.
-    pub fn poll_bg_work(&mut self) {
+    pub async fn poll_recv(mut self, yielder: Yielder) {
         #[cfg(feature = "profiler")]
-        timer!("inetstack::poll_bg_work");
-        {
-            #[cfg(feature = "profiler")]
-            timer!("inetstack::poll_bg_work::poll");
-            self.runtime.poll();
-        }
-
-        {
-            #[cfg(feature = "profiler")]
-            timer!("inetstack::poll_bg_work::for");
-
+        timer!("inetstack::poll");
+        loop {
             for _ in 0..MAX_RECV_ITERS {
                 let batch = {
                     #[cfg(feature = "profiler")]
@@ -543,16 +520,35 @@ impl<const N: usize> InetStack<N> {
                         if let Err(e) = self.do_receive(pkt) {
                             warn!("Dropped packet: {:?}", e);
                         }
-                        // TODO: This is a workaround for https://github.com/demikernel/inetstack/issues/149.
-                        self.runtime.poll();
                     }
                 }
             }
+            match yielder.yield_once().await {
+                Ok(()) => continue,
+                Err(_) => break,
+            };
         }
+    }
 
-        if self.ts_iters == 0 {
-            self.runtime.advance_clock(Instant::now());
-        }
-        self.ts_iters = (self.ts_iters + 1) % TIMER_RESOLUTION;
+    pub fn poll(&mut self) {
+        self.runtime.poll_and_advance_clock();
+    }
+}
+
+//======================================================================================================================
+// Trait Implementation
+//======================================================================================================================
+
+impl<const N: usize> Deref for SharedInetStack<N> {
+    type Target = InetStack<N>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
+    }
+}
+
+impl<const N: usize> DerefMut for SharedInetStack<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.deref_mut()
     }
 }

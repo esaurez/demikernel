@@ -29,6 +29,7 @@ use crate::{
         scheduler::{
             TaskHandle,
             Yielder,
+            YielderHandle,
         },
         Operation,
         OperationResult,
@@ -113,8 +114,6 @@ impl<const N: usize> SharedTcpPeer<N> {
 
     /// Creates a TCP socket.
     pub fn socket(&mut self) -> Result<QDesc, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("tcp::socket");
         let new_queue: SharedTcpQueue<N> = SharedTcpQueue::<N>::new(
             self.runtime.clone(),
             self.transport.clone(),
@@ -146,7 +145,11 @@ impl<const N: usize> SharedTcpPeer<N> {
         }
 
         // TODO: Check if we are binding to a non-local address.
-
+        if *local.ip() != self.local_ipv4_addr {
+            let cause: String = format!("cannot bind to non-local address (qd={:?})", qd);
+            error!("bind(): {}", cause);
+            return Err(Fail::new(libc::EADDRNOTAVAIL, &cause));
+        }
         // Check whether the address is in use.
         if self.runtime.addr_in_use(local) {
             let cause: String = format!("address is already bound to a socket (qd={:?}", qd);
@@ -204,16 +207,16 @@ impl<const N: usize> SharedTcpPeer<N> {
 
     /// Sets up the coroutine for accepting a new connection.
     pub fn accept(&mut self, qd: QDesc) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inet::tcp::accept");
         trace!("accept(): qd={:?}", qd);
+
         let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
-            // Asynchronous accept code. Clone the self reference and move into the coroutine.
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
+            let task_name: String = format!("inetstack::tcp::accept for qd={:?}", qd);
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
             let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().accept_coroutine(qd, yielder));
-            // Insert async coroutine into the scheduler.
-            let task_name: String = format!("Catnap::accept for qd={:?}", qd);
-            self.runtime.insert_coroutine(&task_name, coroutine)
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
         };
 
         queue.accept(coroutine_constructor)
@@ -256,8 +259,6 @@ impl<const N: usize> SharedTcpPeer<N> {
 
     /// Sets up the coroutine for connecting the socket to [remote].
     pub fn connect(&mut self, qd: QDesc, remote: SocketAddrV4) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("inet::tcp::connect");
         trace!("connect(): qd={:?} remote={:?}", qd, remote);
         let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
         // Check whether we need to allocate an ephemeral port.
@@ -284,11 +285,13 @@ impl<const N: usize> SharedTcpPeer<N> {
             );
         }
         let local_isn: SeqNumber = self.isn_generator.generate(&local, &remote);
-        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
-            // Clone the self reference and move into the coroutine.
-            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().connect_coroutine(qd, yielder));
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
             let task_name: String = format!("inetstack::tcp::connect for qd={:?}", qd);
-            self.runtime.insert_coroutine(&task_name, coroutine)
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().connect_coroutine(qd, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
         };
 
         queue.connect(local, remote, local_isn, coroutine_constructor)
@@ -319,12 +322,15 @@ impl<const N: usize> SharedTcpPeer<N> {
     /// Pushes immediately to the socket and returns the result asynchronously.
     pub fn push(&mut self, qd: QDesc, buf: DemiBuffer) -> Result<QToken, Fail> {
         let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
-            // Clone the self reference and move into the coroutine.
-            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().push_coroutine(qd, yielder));
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
             let task_name: String = format!("inetstack::tcp::push for qd={:?}", qd);
-            self.runtime.insert_coroutine(&task_name, coroutine)
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().push_coroutine(qd, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
         };
+
         queue.push(buf, coroutine_constructor)
     }
 
@@ -350,12 +356,15 @@ impl<const N: usize> SharedTcpPeer<N> {
     pub fn pop(&mut self, qd: QDesc, size: Option<usize>) -> Result<QToken, Fail> {
         // Get local address bound to socket.
         let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
-            // Clone the self reference and move into the coroutine.
-            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().pop_coroutine(qd, size, yielder));
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
             let task_name: String = format!("inetstack::tcp::pop for qd={:?}", qd);
-            self.runtime.insert_coroutine(&task_name, coroutine)
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().pop_coroutine(qd, size, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
         };
+
         queue.pop(coroutine_constructor)
     }
 
@@ -389,22 +398,21 @@ impl<const N: usize> SharedTcpPeer<N> {
                 _ => return Err(Fail::new(libc::EINVAL, "socket id did not map to this qd!")),
             };
         }
-        // // Free the queue.
-        // self.runtime
-        //     .free_queue::<SharedTcpQueue<N>>(&qd)
-        //     .expect("queue should exist");
         Ok(())
     }
 
     /// Closes a TCP socket.
     pub fn async_close(&mut self, qd: QDesc) -> Result<QToken, Fail> {
         trace!("Closing socket: qd={:?}", qd);
+
         let mut queue: SharedTcpQueue<N> = self.get_shared_queue(&qd)?;
-        let coroutine_constructor = |yielder: Yielder| -> Result<TaskHandle, Fail> {
-            // Clone the self reference and move into the coroutine.
-            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().close_coroutine(qd, yielder));
+        let coroutine_constructor = || -> Result<TaskHandle, Fail> {
             let task_name: String = format!("inetstack::tcp::close for qd={:?}", qd);
-            self.runtime.insert_coroutine(&task_name, coroutine)
+            let yielder: Yielder = Yielder::new();
+            let yielder_handle: YielderHandle = yielder.get_handle();
+            let coroutine: Pin<Box<Operation>> = Box::pin(self.clone().close_coroutine(qd, yielder));
+            self.runtime
+                .insert_coroutine_with_tracking(&task_name, coroutine, yielder_handle, qd)
         };
 
         queue.async_close(coroutine_constructor)
@@ -462,7 +470,7 @@ impl<const N: usize> SharedTcpPeer<N> {
 
     /// Processes an incoming TCP segment.
     pub fn receive(&mut self, ip_hdr: &Ipv4Header, buf: DemiBuffer) -> Result<(), Fail> {
-        let (mut tcp_hdr, data): (TcpHeader, DemiBuffer) =
+        let (tcp_hdr, data): (TcpHeader, DemiBuffer) =
             TcpHeader::parse(ip_hdr, buf, self.tcp_config.get_rx_checksum_offload())?;
         debug!("TCP received {:?}", tcp_hdr);
         let local: SocketAddrV4 = SocketAddrV4::new(ip_hdr.get_dest_addr(), tcp_hdr.dst_port);
@@ -489,7 +497,7 @@ impl<const N: usize> SharedTcpPeer<N> {
 
         // Dispatch to further processing depending on the socket state.
         self.get_shared_queue(&qd)?
-            .receive(&ip_hdr, &mut tcp_hdr, &local, &remote, data)
+            .receive(ip_hdr, tcp_hdr, local, remote, data)
     }
 }
 

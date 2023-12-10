@@ -47,7 +47,6 @@ use crate::{
         scheduler::{
             TaskHandle,
             Yielder,
-            YielderHandle,
         },
         QDesc,
         QToken,
@@ -61,7 +60,6 @@ use ::futures::channel::mpsc;
 use ::socket2::Type;
 use ::std::{
     any::Any,
-    collections::HashMap,
     net::SocketAddrV4,
     ops::{
         Deref,
@@ -97,7 +95,6 @@ pub struct TcpQueue<const N: usize> {
     tcp_config: TcpConfig,
     arp: SharedArpPeer<N>,
     dead_socket_tx: mpsc::UnboundedSender<QDesc>,
-    pending_ops: HashMap<TaskHandle, YielderHandle>,
 }
 
 #[derive(Clone)]
@@ -126,7 +123,6 @@ impl<const N: usize> SharedTcpQueue<N> {
             tcp_config,
             arp,
             dead_socket_tx,
-            pending_ops: HashMap::<TaskHandle, YielderHandle>::new(),
         }))
     }
 
@@ -140,7 +136,7 @@ impl<const N: usize> SharedTcpQueue<N> {
         dead_socket_tx: mpsc::UnboundedSender<QDesc>,
     ) -> Self {
         Self(SharedObject::<TcpQueue<N>>::new(TcpQueue {
-            state_machine: SocketStateMachine::new_connected(),
+            state_machine: SocketStateMachine::new_established(),
             socket: Socket::Established(socket),
             runtime,
             transport,
@@ -148,7 +144,6 @@ impl<const N: usize> SharedTcpQueue<N> {
             tcp_config,
             arp,
             dead_socket_tx,
-            pending_ops: HashMap::<TaskHandle, YielderHandle>::new(),
         }))
     }
 
@@ -181,11 +176,10 @@ impl<const N: usize> SharedTcpQueue<N> {
 
     pub fn accept<F>(&mut self, coroutine_constructor: F) -> Result<QToken, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
-        self.state_machine.prepare(SocketOp::Accept)?;
         Ok(self
-            .do_generic_sync_control_path_call(coroutine_constructor)?
+            .do_generic_sync_data_path_call(coroutine_constructor)?
             .get_task_id()
             .into())
     }
@@ -198,7 +192,6 @@ impl<const N: usize> SharedTcpQueue<N> {
             _ => unreachable!("State machine check should ensure that this socket is listening"),
         };
         let new_socket: EstablishedSocket<N> = listening_socket.do_accept(yielder).await?;
-        self.state_machine.prepare(SocketOp::Accepted)?;
         // Insert queue into queue table and get new queue descriptor.
         let new_queue = Self::new_established(
             new_socket,
@@ -209,7 +202,6 @@ impl<const N: usize> SharedTcpQueue<N> {
             self.arp.clone(),
             self.dead_socket_tx.clone(),
         );
-        self.state_machine.commit();
         Ok(new_queue)
     }
 
@@ -221,7 +213,7 @@ impl<const N: usize> SharedTcpQueue<N> {
         coroutine_constructor: F,
     ) -> Result<QToken, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
         self.state_machine.prepare(SocketOp::Connect)?;
 
@@ -250,16 +242,24 @@ impl<const N: usize> SharedTcpQueue<N> {
             Socket::Connecting(ref connecting_socket) => connecting_socket.clone(),
             _ => unreachable!("State machine check should ensure that this socket is connecting"),
         };
-        let socket: EstablishedSocket<N> = connecting_socket.connect(yielder).await?;
-        self.state_machine.prepare(SocketOp::Connected)?;
-        self.socket = Socket::Established(socket);
-        self.state_machine.commit();
-        Ok(())
+        match connecting_socket.connect(yielder).await {
+            Ok(socket) => {
+                self.state_machine.prepare(SocketOp::Established)?;
+                self.socket = Socket::Established(socket);
+                self.state_machine.commit();
+                Ok(())
+            },
+            Err(e) => {
+                self.state_machine.prepare(SocketOp::Closed)?;
+                self.state_machine.commit();
+                Err(e)
+            },
+        }
     }
 
     pub fn push<F>(&mut self, buf: DemiBuffer, coroutine_constructor: F) -> Result<QToken, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
         self.state_machine.may_push()?;
         // Send synchronously.
@@ -279,7 +279,7 @@ impl<const N: usize> SharedTcpQueue<N> {
 
     pub fn pop<F>(&mut self, coroutine_constructor: F) -> Result<QToken, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
         self.state_machine.may_pop()?;
         Ok(self
@@ -298,7 +298,7 @@ impl<const N: usize> SharedTcpQueue<N> {
 
     pub fn async_close<F>(&mut self, coroutine_constructor: F) -> Result<QToken, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
         self.state_machine.prepare(SocketOp::Close)?;
         let new_socket: Option<Socket<N>> = match self.socket {
@@ -347,14 +347,12 @@ impl<const N: usize> SharedTcpQueue<N> {
             _ => unreachable!("We do not support closing of other socket types"),
         };
         self.state_machine.prepare(SocketOp::Closed)?;
-        self.cancel_pending_ops(Fail::new(libc::ECANCELED, "This queue was closed"));
         self.state_machine.commit();
         Ok(result)
     }
 
     pub fn close(&mut self) -> Result<Option<SocketId>, Fail> {
         self.state_machine.prepare(SocketOp::Close)?;
-        self.cancel_pending_ops(Fail::new(libc::ECANCELED, "This queue was closed"));
         let new_socket: Option<Socket<N>> = match self.socket {
             // Closing an active socket.
             Socket::Established(ref mut socket) => {
@@ -421,11 +419,27 @@ impl<const N: usize> SharedTcpQueue<N> {
     pub fn receive(
         &mut self,
         ip_hdr: &Ipv4Header,
-        tcp_hdr: &mut TcpHeader,
-        local: &SocketAddrV4,
-        remote: &SocketAddrV4,
+        tcp_hdr: TcpHeader,
+        local: SocketAddrV4,
+        remote: SocketAddrV4,
         buf: DemiBuffer,
     ) -> Result<(), Fail> {
+        // Generate the RST segment accordingly to the ACK field.
+        // If the incoming segment has an ACK field, the reset takes its
+        // sequence number from the ACK field of the segment, otherwise the
+        // reset has sequence number zero and the ACK field is set to the sum
+        // of the sequence number and segment length of the incoming segment.
+        // Reference: https://datatracker.ietf.org/doc/html/rfc793#section-3.4
+        let (seq_num, ack_num): (SeqNumber, Option<SeqNumber>) = if tcp_hdr.ack {
+            (tcp_hdr.ack_num, None)
+        } else {
+            (
+                SeqNumber::from(0),
+                Some(tcp_hdr.seq_num + SeqNumber::from(tcp_hdr.compute_size() as u32)),
+            )
+        };
+
+        // Route the TCP packet to the socket.
         match self.socket {
             Socket::Established(ref mut socket) => {
                 debug!("Routing to established connection: {:?}", socket.endpoints());
@@ -434,12 +448,12 @@ impl<const N: usize> SharedTcpQueue<N> {
             },
             Socket::Connecting(ref mut socket) => {
                 debug!("Routing to connecting connection: {:?}", socket.endpoints());
-                socket.receive(&tcp_hdr);
+                socket.receive(tcp_hdr);
                 return Ok(());
             },
             Socket::Listening(ref mut socket) => {
                 debug!("Routing to passive connection: {:?}", socket.endpoint());
-                match socket.receive(ip_hdr, &tcp_hdr) {
+                match socket.receive(ip_hdr, tcp_hdr, buf) {
                     Ok(()) => return Ok(()),
                     // Connection was refused.
                     Err(e) if e.errno == libc::ECONNREFUSED => {
@@ -462,21 +476,6 @@ impl<const N: usize> SharedTcpQueue<N> {
                 return Ok(());
             },
         }
-
-        // Generate the RST segment accordingly to the ACK field.
-        // If the incoming segment has an ACK field, the reset takes its
-        // sequence number from the ACK field of the segment, otherwise the
-        // reset has sequence number zero and the ACK field is set to the sum
-        // of the sequence number and segment length of the incoming segment.
-        // Reference: https://datatracker.ietf.org/doc/html/rfc793#section-3.4
-        let (seq_num, ack_num): (SeqNumber, Option<SeqNumber>) = if tcp_hdr.ack {
-            (tcp_hdr.ack_num, None)
-        } else {
-            (
-                SeqNumber::from(0),
-                Some(tcp_hdr.seq_num + SeqNumber::from(tcp_hdr.compute_size() as u32)),
-            )
-        };
 
         debug!("receive(): sending RST (local={:?}, remote={:?})", local, remote);
         self.send_rst(&local, &remote, seq_num, ack_num)?;
@@ -528,45 +527,18 @@ impl<const N: usize> SharedTcpQueue<N> {
         Ok(())
     }
 
-    /// Removes an operation from the list of pending operations on this queue. This function should only be called if
-    /// add_pending_op() was previously called.
-    /// TODO: Remove this when we clean up take_result().
-    /// This function is deprecated, do not use.
-    /// FIXME: https://github.com/microsoft/demikernel/issues/888
-    pub fn remove_pending_op(&mut self, handle: &TaskHandle) {
-        self.pending_ops.remove(handle);
-    }
-
-    /// Adds a new operation to the list of pending operations on this queue.
-    fn add_pending_op(&mut self, handle: &TaskHandle, yielder_handle: &YielderHandle) {
-        self.pending_ops.insert(handle.clone(), yielder_handle.clone());
-    }
-
-    /// Cancel all currently pending operations on this queue. If the operation is not complete and the coroutine has
-    /// yielded, wake the coroutine with an error.
-    fn cancel_pending_ops(&mut self, cause: Fail) {
-        for (handle, mut yielder_handle) in self.pending_ops.drain() {
-            if !handle.has_completed() {
-                yielder_handle.wake_with(Err(cause.clone()));
-            }
-        }
-    }
-
     /// Generic function for spawning a control-path coroutine on [self].
     fn do_generic_sync_control_path_call<F>(&mut self, coroutine: F) -> Result<TaskHandle, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
-        let yielder: Yielder = Yielder::new();
-        let yielder_handle: YielderHandle = yielder.get_handle();
         // Spawn coroutine.
-        match coroutine(Yielder::new()) {
+        match coroutine() {
             // We successfully spawned the coroutine.
-            Ok(handle) => {
+            Ok(task_handle) => {
                 // Commit the operation on the socket.
-                self.add_pending_op(&handle, &yielder_handle);
                 self.state_machine.commit();
-                Ok(handle)
+                Ok(task_handle)
             },
             // We failed to spawn the coroutine.
             Err(e) => {
@@ -580,13 +552,9 @@ impl<const N: usize> SharedTcpQueue<N> {
     /// Generic function for spawning a data-path coroutine on [self].
     fn do_generic_sync_data_path_call<F>(&mut self, coroutine: F) -> Result<TaskHandle, Fail>
     where
-        F: FnOnce(Yielder) -> Result<TaskHandle, Fail>,
+        F: FnOnce() -> Result<TaskHandle, Fail>,
     {
-        let yielder: Yielder = Yielder::new();
-        let yielder_handle: YielderHandle = yielder.get_handle();
-        let task_handle: TaskHandle = coroutine(yielder)?;
-        self.add_pending_op(&task_handle, &yielder_handle);
-        Ok(task_handle)
+        coroutine()
     }
 }
 

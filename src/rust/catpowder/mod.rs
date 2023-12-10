@@ -11,7 +11,7 @@ pub mod runtime;
 use self::runtime::LinuxRuntime;
 use crate::{
     demikernel::config::Config,
-    inetstack::InetStack,
+    inetstack::SharedInetStack,
     runtime::{
         fail::Fail,
         memory::MemoryRuntime,
@@ -49,7 +49,7 @@ use crate::timer;
 /// Catpowder LibOS
 pub struct CatpowderLibOS {
     runtime: SharedDemiRuntime,
-    inetstack: InetStack<RECEIVE_BATCH_SIZE>,
+    inetstack: SharedInetStack<RECEIVE_BATCH_SIZE>,
     transport: LinuxRuntime,
 }
 
@@ -68,7 +68,7 @@ impl CatpowderLibOS {
             HashMap::default(),
         );
         let rng_seed: [u8; 32] = [0; 32];
-        let inetstack: InetStack<RECEIVE_BATCH_SIZE> = InetStack::new(
+        let inetstack: SharedInetStack<RECEIVE_BATCH_SIZE> = SharedInetStack::new(
             runtime.clone(),
             SharedBox::<dyn NetworkRuntime<RECEIVE_BATCH_SIZE>>::new(Box::new(transport.clone())),
             transport.get_link_addr(),
@@ -90,8 +90,6 @@ impl CatpowderLibOS {
     /// IO connection represented by `qd`. This operation returns immediately with a `QToken`.
     /// The data has been written when [`wait`ing](Self::wait) on the QToken returns.
     pub fn push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnip::push");
         trace!("push(): qd={:?}", qd);
         match self.transport.clone_sgarray(sga) {
             Ok(buf) => {
@@ -105,9 +103,7 @@ impl CatpowderLibOS {
     }
 
     pub fn pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t, to: SocketAddr) -> Result<QToken, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("catnip::pushto");
-        trace!("pushto2(): qd={:?}", qd);
+        trace!("pushto(): qd={:?}", qd);
         match self.transport.clone_sgarray(sga) {
             Ok(buf) => {
                 if buf.len() == 0 {
@@ -126,8 +122,7 @@ impl CatpowderLibOS {
     }
 
     pub fn pack_result(&mut self, handle: TaskHandle, qt: QToken) -> Result<demi_qresult_t, Fail> {
-        let result: demi_qresult_t = self.runtime.remove_coroutine_and_get_result(&handle, qt.into());
-        Ok(result)
+        self.runtime.remove_coroutine_and_get_result(&handle, qt.into())
     }
 
     /// Allocates a scatter-gather array.
@@ -147,7 +142,7 @@ impl CatpowderLibOS {
 
 /// De-Reference Trait Implementation for Catpowder LibOS
 impl Deref for CatpowderLibOS {
-    type Target = InetStack<RECEIVE_BATCH_SIZE>;
+    type Target = SharedInetStack<RECEIVE_BATCH_SIZE>;
 
     fn deref(&self) -> &Self::Target {
         &self.inetstack

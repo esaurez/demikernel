@@ -60,6 +60,11 @@ use crate::{
 };
 use ::std::{
     boxed::Box,
+    collections::HashMap,
+    convert::{
+        AsMut,
+        AsRef,
+    },
     future::Future,
     mem,
     net::SocketAddrV4,
@@ -85,11 +90,20 @@ use crate::pal::functions::socketaddrv4_to_sockaddr;
 #[cfg(target_os = "linux")]
 use crate::pal::linux::socketaddrv4_to_sockaddr;
 
-use self::types::{
-    demi_accept_result_t,
-    demi_qr_value_t,
-    demi_qresult_t,
+use self::{
+    scheduler::YielderHandle,
+    types::{
+        demi_accept_result_t,
+        demi_qr_value_t,
+        demi_qresult_t,
+    },
 };
+
+//======================================================================================================================
+// Constants
+//======================================================================================================================
+
+const TIMER_RESOLUTION: usize = 64;
 
 //======================================================================================================================
 // Structures
@@ -108,6 +122,9 @@ pub struct DemiRuntime {
     timer: SharedTimer,
     /// Shared table for mapping from underlying transport identifiers to queue descriptors.
     network_table: NetworkQueueTable,
+    /// Currently running coroutines.
+    pending_ops: HashMap<QDesc, HashMap<TaskHandle, YielderHandle>>,
+    ts_iters: usize,
 }
 
 #[derive(Clone)]
@@ -148,6 +165,8 @@ impl SharedDemiRuntime {
             ephemeral_ports: EphemeralPorts::default(),
             timer: SharedTimer::new(now),
             network_table: NetworkQueueTable::default(),
+            pending_ops: HashMap::<QDesc, HashMap<TaskHandle, YielderHandle>>::new(),
+            ts_iters: 0,
         }))
     }
 
@@ -162,6 +181,28 @@ impl SharedDemiRuntime {
                 error!("insert_coroutine(): {}", cause);
                 Err(Fail::new(libc::EAGAIN, &cause))
             },
+        }
+    }
+
+    /// Inserts the `coroutine` named `task_name` into the scheduler. This function also tracks the qd, coroutine and
+    /// it's yielder_handle.
+    pub fn insert_coroutine_with_tracking(
+        &mut self,
+        task_name: &str,
+        coroutine: Pin<Box<Operation>>,
+        yielder_handle: YielderHandle,
+        qd: QDesc,
+    ) -> Result<TaskHandle, Fail> {
+        match self.insert_coroutine(task_name, coroutine) {
+            Ok(task_handle) => {
+                // This allows to keep track of currently running coroutines.
+                self.pending_ops
+                    .entry(qd)
+                    .or_insert(HashMap::new())
+                    .insert(task_handle.clone(), yielder_handle.clone());
+                Ok(task_handle)
+            },
+            Err(e) => Err(e),
         }
     }
 
@@ -184,17 +225,48 @@ impl SharedDemiRuntime {
 
     /// Removes a coroutine from the underlying scheduler given its associated [TaskHandle] `handle`
     /// and gets the result immediately.
-    pub fn remove_coroutine_and_get_result(&mut self, handle: &TaskHandle, qt: u64) -> demi_qresult_t {
-        // 1. Remove Task from scheduler.
-        let boxed_task: Box<dyn Task> = self
-            .scheduler
-            .remove(handle)
-            .expect("Removing task that does not exist (either was previously removed or never inserted");
-        // 2. Cast to void and then downcast to operation task.
-        trace!("Removing coroutine: {:?}", boxed_task.get_name());
-        let operation_task: OperationTask = OperationTask::from(boxed_task.as_any());
-        let (qd, result) = operation_task.get_result().expect("Coroutine not finished");
-        self.pack_result(result, qd, qt)
+    pub fn remove_coroutine_and_get_result(&mut self, handle: &TaskHandle, qt: u64) -> Result<demi_qresult_t, Fail> {
+        let operation_task: OperationTask = self.remove_coroutine(handle);
+        let (qd, result) = operation_task.get_result().expect("coroutine not finished");
+        self.cancel_or_remove_pending_ops_as_needed(&result, &qd, handle);
+        Ok(self.pack_result(result, qd, qt))
+    }
+
+    /// When the queue is closed, we need to cancel all pending ops. When the coroutine is removed, we only need to
+    /// cancel the pending op associated with the handle.
+    fn cancel_or_remove_pending_ops_as_needed(
+        &mut self,
+        result: &OperationResult,
+        qd: &QDesc,
+        task_handle: &TaskHandle,
+    ) {
+        match result {
+            OperationResult::Close => {
+                self.cancel_all_pending_ops_for_queue(qd);
+            },
+            _ => {
+                self.cancel_pending_op(qd, task_handle);
+            },
+        }
+    }
+
+    /// Cancel pending op because the coroutine was removed.
+    fn cancel_pending_op(&mut self, qd: &QDesc, task_handle: &TaskHandle) {
+        if let Some(inner_hash_map) = self.pending_ops.get_mut(&qd) {
+            inner_hash_map.remove(task_handle);
+        }
+    }
+
+    /// Cancel all pending ops because the queue was closed.
+    fn cancel_all_pending_ops_for_queue(&mut self, qd: &QDesc) {
+        if let Some(inner_hash_map) = &mut self.pending_ops.remove(&qd) {
+            let drain = inner_hash_map.drain();
+            for (handle, mut yielder_handle) in drain {
+                if !handle.has_completed() {
+                    yielder_handle.wake_with(Err(Fail::new(libc::ECANCELED, "This queue was closed")));
+                }
+            }
+        }
     }
 
     /// Inserts the background `coroutine` named `task_name` into the scheduler.
@@ -229,6 +301,14 @@ impl SharedDemiRuntime {
                 Err(Fail::new(libc::ESRCH, &cause))
             },
         }
+    }
+
+    pub fn poll_and_advance_clock(&mut self) {
+        if self.ts_iters == 0 {
+            self.advance_clock(Instant::now());
+        }
+        self.ts_iters = (self.ts_iters + 1) % TIMER_RESOLUTION;
+        self.poll()
     }
 
     /// Performs a single pool on the underlying scheduler.
@@ -268,6 +348,7 @@ impl SharedDemiRuntime {
     /// Frees the queue associated with [qd] and returns the freed queue.
     pub fn free_queue<T: IoQueue>(&mut self, qd: &QDesc) -> Result<T, Fail> {
         trace!("Freeing queue: qd={:?}", qd);
+        self.cancel_all_pending_ops_for_queue(qd);
         self.qtable.free(qd)
     }
 
@@ -490,6 +571,7 @@ impl Default for SharedDemiRuntime {
     }
 }
 
+/// Dereferences a shared object for use.
 impl<T> Deref for SharedObject<T> {
     type Target = T;
 
@@ -498,8 +580,33 @@ impl<T> Deref for SharedObject<T> {
     }
 }
 
+/// Dereferences a mutable reference to a shared object for use. This breaks Rust's ownership model because it allows
+/// more than one mutable dereference of a shared object at a time. Demikernel requires this because multiple
+/// coroutines will have mutable references to shared objects at the same time; however, Demikernel also ensures that
+/// only one coroutine will run at a time. Due to this design, Rust's static borrow checker is not able to ensure
+/// memory safety and we have chosen not to use the dynamic borrow checker. Instead, shared objects should be used
+/// judiciously across coroutines with the understanding that the shared object may change/be mutated whenever the
+/// coroutine yields.
 impl<T> DerefMut for SharedObject<T> {
     fn deref_mut<'a>(&'a mut self) -> &'a mut Self::Target {
+        let ptr: *mut T = Rc::as_ptr(&self.0) as *mut T;
+        unsafe { &mut *ptr }
+    }
+}
+
+/// Returns a reference to the interior object, which is borrowed for directly accessing the value. Generally deref
+/// should be used unless you absolutely need to borrow the reference.
+impl<T> AsRef<T> for SharedObject<T> {
+    fn as_ref(&self) -> &T {
+        self.0.as_ref()
+    }
+}
+
+/// Returns a mutable reference to the interior object. Similar to DerefMut, this breaks Rust's ownership properties
+/// and should be considered unsafe. However, it is safe to use in Demikernel if and only if we only run one coroutine
+/// at a time.
+impl<T> AsMut<T> for SharedObject<T> {
+    fn as_mut<'a>(&'a mut self) -> &'a mut T {
         let ptr: *mut T = Rc::as_ptr(&self.0) as *mut T;
         unsafe { &mut *ptr }
     }
