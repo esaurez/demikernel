@@ -20,10 +20,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     slice,
-    time::{
-        Duration,
-        Instant,
-    },
+    time::Instant
 };
 
 #[cfg(target_os = "windows")]
@@ -87,13 +84,13 @@ impl TcpEchoClient {
     /// Runs the target TCP echo client.
     pub fn run_sequential(
         &mut self,
-        log_interval: Option<u64>,
+        _log_interval: Option<u64>,
         nclients: usize,
         nrequests: Option<usize>,
         niterations: usize,
     ) -> Result<()> {
-        let start: Instant = Instant::now();
-        let mut last_log: Instant = Instant::now();
+
+        let mut start: Instant = Instant::now();
         for _ in 0..niterations {
             self.nechoed = 0;
             // Open all connections.
@@ -114,17 +111,6 @@ impl TcpEchoClient {
                     }
                 }
 
-                // Dump statistics.
-                if let Some(log_interval) = log_interval {
-                    if last_log.elapsed() > Duration::from_secs(log_interval) {
-                        let time_elapsed: u64 = (Instant::now() - start).as_secs() as u64;
-                        let nrequests: u64 = (self.nbytes / self.bufsize) as u64;
-                        let rps: u64 = nrequests / time_elapsed;
-                        println!("INFO: {:?} rps", rps);
-                        last_log = Instant::now();
-                    }
-                }
-
                 let qr: demi_qresult_t = {
                     let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
                     self.unregister_operation(index)?;
@@ -140,6 +126,7 @@ impl TcpEchoClient {
                     demi_opcode_t::DEMI_OPC_CLOSE => self.handle_unexpected("close", &qr)?,
                     demi_opcode_t::DEMI_OPC_CONNECT => {
                         println!("INFO: Client connected");
+                        start = Instant::now();
                         // Push first request.
                         let sockqd: QDesc = qr.qr_qd.into();
                         self.issue_push(sockqd)?;
@@ -151,6 +138,12 @@ impl TcpEchoClient {
                 if self.clients.len() == 0 {
                     break;
                 }
+            }
+
+            if let Some(nrequests) = nrequests {
+                let time_elapsed: u64 = (Instant::now() - start).as_micros() as u64;
+                let average: u64 = time_elapsed / nrequests as u64;
+                println!("INFO: Average latency {:?} us", average);
             }
 
             // Close all connections.
