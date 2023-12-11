@@ -59,6 +59,10 @@ pub struct TcpEchoClient {
     qts: Vec<QToken>,
     /// Reverse lookup table of pending operations.
     qts_reverse: HashMap<QToken, QDesc>,
+    // Last time we pushed
+    last_push: HashMap<QDesc, Instant>,
+    // Vector of push to response times
+    push_to_response: Vec<u64>,
 }
 
 //======================================================================================================================
@@ -78,6 +82,8 @@ impl TcpEchoClient {
             clients: HashMap::default(),
             qts: Vec::default(),
             qts_reverse: HashMap::default(),
+            last_push: HashMap::default(),
+            push_to_response: Vec::default(),
         });
     }
 
@@ -150,6 +156,24 @@ impl TcpEchoClient {
             for (qd, _) in self.clients.drain().collect::<Vec<_>>() {
                 self.handle_close(qd)?;
             }
+
+            // Print statistics of the push_to_response
+            let mut sum: u64 = 0;
+            let mut max: u64 = 0;
+            let mut min: u64 = u64::MAX;
+            for time in &self.push_to_response {
+                sum += time;
+                if *time > max {
+                    max = *time;
+                }
+                if *time < min {
+                    min = *time;
+                }
+            }
+            let average: u64 = sum / self.push_to_response.len() as u64;
+            println!("INFO: Average push to response {:?} us", average);
+            println!("INFO: Max push to response {:?} us", max);
+            println!("INFO: Min push to response {:?} us", min);
         }
 
         Ok(())
@@ -211,6 +235,12 @@ impl TcpEchoClient {
             }
             // Push another packet.
             else {
+                // Check if qd is contained in last_punch
+                if let Some(begin) = self.last_push.remove(&qd) 
+                {
+                    let time_elapsed: u64 = (Instant::now() - begin).as_micros() as u64;
+                    self.push_to_response.push(time_elapsed);
+                }
                 // There aren't, so push another packet.
                 *index = 0;
                 self.nechoed += 1;
@@ -272,6 +302,7 @@ impl TcpEchoClient {
 
     /// Issues a push operation
     fn issue_push(&mut self, qd: QDesc) -> Result<()> {
+        self.last_push.insert(qd, Instant::now());
         let fill_char: u8 = (self.npushed % (u8::MAX as usize - 1) + 1) as u8;
         let sga: demi_sgarray_t = self.mksga(self.bufsize, fill_char)?;
         let qt: QToken = self.libos.push(qd, &sga)?;
