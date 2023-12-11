@@ -95,7 +95,10 @@ impl TcpEchoClient {
         nrequests: Option<usize>,
         niterations: usize,
     ) -> Result<()> {
-
+        // Reserve enough capacity in last_push
+        self.last_push.reserve(nclients);
+        // Reserve enough capacity in push_to_response
+        self.push_to_response.reserve(nclients * niterations);
         let mut start: Instant = Instant::now();
         for _ in 0..niterations {
             self.nechoed = 0;
@@ -159,21 +162,24 @@ impl TcpEchoClient {
 
             // Print statistics of the push_to_response
             let mut sum: u64 = 0;
-            let mut max: u64 = 0;
-            let mut min: u64 = u64::MAX;
+            // Sort the vector
+            self.push_to_response.sort();
             for time in &self.push_to_response {
                 sum += time;
-                if *time > max {
-                    max = *time;
-                }
-                if *time < min {
-                    min = *time;
-                }
             }
             let average: u64 = sum / self.push_to_response.len() as u64;
             println!("INFO: Average push to response {:?} us", average);
-            println!("INFO: Max push to response {:?} us", max);
-            println!("INFO: Min push to response {:?} us", min);
+            println!("INFO: Max push to response {:?} us", self.push_to_response[self.push_to_response.len() - 1]);
+            println!("INFO: Min push to response {:?} us", self.push_to_response[0]);
+            // Print percentile 90
+            let p90_index: usize = (self.push_to_response.len() as f64 * 0.9) as usize;
+            println!("INFO: 90th percentile push to response {:?} us", self.push_to_response[p90_index]);
+            // Print percentile 10
+            let p10_index = (self.push_to_response.len() as f64 * 0.1) as usize;
+            println!("INFO: 10th percentile push to response {:?} us", self.push_to_response[p10_index]);
+
+            self.push_to_response.clear();
+            self.last_push.clear();
         }
 
         Ok(())
