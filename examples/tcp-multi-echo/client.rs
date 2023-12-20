@@ -59,10 +59,8 @@ pub struct TcpEchoClient {
     qts: Vec<QToken>,
     /// Reverse lookup table of pending operations.
     qts_reverse: HashMap<QToken, QDesc>,
-    // Last time we pushed
-    last_push: HashMap<QDesc, Instant>,
-    // Vector of push to response times
-    push_to_response: Vec<u64>,
+    // Time after the first message was completed 
+    start_time: HashMap<QDesc, Instant>,
 }
 
 //======================================================================================================================
@@ -82,8 +80,7 @@ impl TcpEchoClient {
             clients: HashMap::default(),
             qts: Vec::default(),
             qts_reverse: HashMap::default(),
-            last_push: HashMap::default(),
-            push_to_response: Vec::default(),
+            start_time: HashMap::default(),
         });
     }
 
@@ -95,10 +92,6 @@ impl TcpEchoClient {
         nrequests: Option<usize>,
         niterations: usize,
     ) -> Result<()> {
-        // Reserve enough capacity in last_push
-        self.last_push.reserve(nclients);
-        // Reserve enough capacity in push_to_response
-        self.push_to_response.reserve(nclients * niterations);
         let mut start: Instant = Instant::now();
         for _ in 0..niterations {
             self.nechoed = 0;
@@ -135,7 +128,6 @@ impl TcpEchoClient {
                     demi_opcode_t::DEMI_OPC_CLOSE => self.handle_unexpected("close", &qr)?,
                     demi_opcode_t::DEMI_OPC_CONNECT => {
                         println!("INFO: Client connected");
-                        start = Instant::now();
                         // Push first request.
                         let sockqd: QDesc = qr.qr_qd.into();
                         self.issue_push(sockqd)?;
@@ -150,9 +142,13 @@ impl TcpEchoClient {
             }
 
             if let Some(nrequests) = nrequests {
-                let time_elapsed: u64 = (Instant::now() - start).as_micros() as u64;
-                let average: u64 = time_elapsed / nrequests as u64;
-                println!("INFO: Average latency {:?} us", average);
+                // For each client print the average latency, using the start time in start_time 
+                let time_now = Instant::now();
+                for (qd, begin) in &self.start_time {
+                    let time_elapsed: u64 = (time_now - *begin).as_nanos() as u64;
+                    let average: u64 = time_elapsed / nrequests as u64;
+                    println!("INFO: Average latency {:?} ns", average);
+                }
             }
 
             // Close all connections.
@@ -160,26 +156,7 @@ impl TcpEchoClient {
                 self.handle_close(qd)?;
             }
 
-            // Print statistics of the push_to_response
-            let mut sum: u64 = 0;
-            // Sort the vector
-            self.push_to_response.sort();
-            for time in &self.push_to_response {
-                sum += time;
-            }
-            let average: u64 = sum / self.push_to_response.len() as u64;
-            println!("INFO: Average push to response {:?} us", average);
-            println!("INFO: Max push to response {:?} us", self.push_to_response[self.push_to_response.len() - 1]);
-            println!("INFO: Min push to response {:?} us", self.push_to_response[0]);
-            // Print percentile 90
-            let p90_index: usize = (self.push_to_response.len() as f64 * 0.9) as usize;
-            println!("INFO: 90th percentile push to response {:?} us", self.push_to_response[p90_index]);
-            // Print percentile 10
-            let p10_index = (self.push_to_response.len() as f64 * 0.1) as usize;
-            println!("INFO: 10th percentile push to response {:?} us", self.push_to_response[p10_index]);
-
-            self.push_to_response.clear();
-            self.last_push.clear();
+            self.start_time.clear();
         }
 
         Ok(())
@@ -241,11 +218,9 @@ impl TcpEchoClient {
             }
             // Push another packet.
             else {
-                // Check if qd is contained in last_punch
-                if let Some(begin) = self.last_push.remove(&qd) 
-                {
-                    let time_elapsed: u64 = (Instant::now() - begin).as_micros() as u64;
-                    self.push_to_response.push(time_elapsed);
+                // Add start time if it is not already there
+                if !self.start_time.contains_key(&qd) {
+                    self.start_time.insert(qd, Instant::now());
                 }
                 // There aren't, so push another packet.
                 *index = 0;
@@ -308,7 +283,6 @@ impl TcpEchoClient {
 
     /// Issues a push operation
     fn issue_push(&mut self, qd: QDesc) -> Result<()> {
-        self.last_push.insert(qd, Instant::now());
         let fill_char: u8 = (self.npushed % (u8::MAX as usize - 1) + 1) as u8;
         let sga: demi_sgarray_t = self.mksga(self.bufsize, fill_char)?;
         let qt: QToken = self.libos.push(qd, &sga)?;
