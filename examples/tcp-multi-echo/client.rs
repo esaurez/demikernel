@@ -92,7 +92,6 @@ impl TcpEchoClient {
         nrequests: Option<usize>,
         niterations: usize,
     ) -> Result<()> {
-        let mut start: Instant = Instant::now();
         for _ in 0..niterations {
             self.nechoed = 0;
             // Open all connections.
@@ -144,7 +143,7 @@ impl TcpEchoClient {
             if let Some(nrequests) = nrequests {
                 // For each client print the average latency, using the start time in start_time 
                 let time_now = Instant::now();
-                for (qd, begin) in &self.start_time {
+                for (_qd, begin) in &self.start_time {
                     let time_elapsed: u64 = (time_now - *begin).as_nanos() as u64;
                     let average: u64 = time_elapsed / nrequests as u64;
                     println!("INFO: Average latency {:?} ns", average);
