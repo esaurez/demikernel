@@ -7,18 +7,21 @@
 
 use crate::runtime::{
     logging,
-    memory::DemiBuffer,
+    memory::{
+        DemiBuffer,
+        MemoryRuntime,
+    },
     network::{
         config::{
             ArpConfig,
             TcpConfig,
             UdpConfig,
         },
+        consts::RECEIVE_BATCH_SIZE,
         types::MacAddress,
         NetworkRuntime,
         PacketBuf,
     },
-    timer::SharedTimer,
     SharedDemiRuntime,
     SharedObject,
 };
@@ -78,7 +81,7 @@ impl SharedTestRuntime {
     }
 
     /// Remove a fixed number of frames from the runtime's outgoing queue.
-    pub fn pop_frames(&mut self, num_frames: usize) -> VecDeque<DemiBuffer> {
+    fn pop_frames(&mut self, num_frames: usize) -> VecDeque<DemiBuffer> {
         let length: usize = self.outgoing.len();
         self.outgoing.split_off(length - num_frames)
     }
@@ -92,20 +95,6 @@ impl SharedTestRuntime {
         self.pop_frames(1).pop_front().expect("should be at least one frame")
     }
 
-    /// Remove a single frame from the runtime's outgoing queue if it is not empty.
-    pub fn pop_frame_unchecked(&mut self) -> Option<DemiBuffer> {
-        self.pop_frames(1).pop_front()
-    }
-
-    /// Add a frame to the runtime's incoming queue.
-    pub fn push_frame(&mut self, buf: DemiBuffer) {
-        self.incoming.push_back(buf);
-    }
-
-    pub fn poll_scheduler(&mut self) {
-        self.runtime.poll();
-    }
-
     /// Get the link address assigned to the runtime.
     pub fn get_link_addr(&self) -> MacAddress {
         self.link_addr
@@ -114,31 +103,6 @@ impl SharedTestRuntime {
     /// Get the ip address assigned to the runtime.
     pub fn get_ip_addr(&self) -> Ipv4Addr {
         self.ipv4_addr
-    }
-
-    /// Get the arp configuration options for the runtime.
-    pub fn get_arp_config(&self) -> ArpConfig {
-        self.arp_config.clone()
-    }
-
-    /// Get the udp configuration options for the runtime.
-    pub fn get_udp_config(&self) -> UdpConfig {
-        self.udp_config.clone()
-    }
-
-    /// Get the tcp configuration options for the runtime.
-    pub fn get_tcp_config(&self) -> TcpConfig {
-        self.tcp_config.clone()
-    }
-
-    /// Get the runtime's clock.
-    pub fn get_timer(&self) -> SharedTimer {
-        self.runtime.get_timer()
-    }
-
-    /// Advance runtime's clock
-    pub fn advance_clock(&mut self, now: Instant) {
-        self.runtime.advance_clock(now)
     }
 
     /// Get the underlying DemiRuntime.
@@ -151,7 +115,7 @@ impl SharedTestRuntime {
 // Trait Implementations
 //==============================================================================
 
-impl<const N: usize> NetworkRuntime<N> for SharedTestRuntime {
+impl NetworkRuntime for SharedTestRuntime {
     fn transmit(&mut self, pkt: Box<dyn PacketBuf>) {
         let header_size: usize = pkt.header_size();
         let body_size: usize = pkt.body_size();
@@ -169,12 +133,24 @@ impl<const N: usize> NetworkRuntime<N> for SharedTestRuntime {
         self.outgoing.push_back(buf);
     }
 
-    fn receive(&mut self) -> ArrayVec<DemiBuffer, N> {
+    fn receive(&mut self) -> ArrayVec<DemiBuffer, RECEIVE_BATCH_SIZE> {
         let mut out = ArrayVec::new();
         if let Some(buf) = self.incoming.pop_front() {
             out.push(buf);
         }
         out
+    }
+
+    fn get_arp_config(&self) -> ArpConfig {
+        self.arp_config.clone()
+    }
+
+    fn get_tcp_config(&self) -> TcpConfig {
+        self.tcp_config.clone()
+    }
+
+    fn get_udp_config(&self) -> UdpConfig {
+        self.udp_config.clone()
     }
 }
 
@@ -195,3 +171,5 @@ impl DerefMut for SharedTestRuntime {
         self.0.deref_mut()
     }
 }
+
+impl MemoryRuntime for SharedTestRuntime {}

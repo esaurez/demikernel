@@ -15,6 +15,12 @@ use crate::{
         limits,
         memory::DemiBuffer,
         network::{
+            config::{
+                ArpConfig,
+                TcpConfig,
+                UdpConfig,
+            },
+            consts::RECEIVE_BATCH_SIZE,
             NetworkRuntime,
             PacketBuf,
         },
@@ -31,7 +37,7 @@ use ::std::mem::{
 //==============================================================================
 
 /// Network Runtime Trait Implementation for Linux Runtime
-impl<const N: usize> NetworkRuntime<N> for LinuxRuntime {
+impl NetworkRuntime for LinuxRuntime {
     /// Transmits a single [PacketBuf].
     fn transmit(&mut self, pkt: Box<dyn PacketBuf>) {
         let header_size: usize = pkt.header_size();
@@ -60,7 +66,7 @@ impl<const N: usize> NetworkRuntime<N> for LinuxRuntime {
 
     /// Receives a batch of [DemiBuffer].
     // TODO: This routine currently only tries to receive a single packet buffer, not a batch of them.
-    fn receive(&mut self) -> ArrayVec<DemiBuffer, N> {
+    fn receive(&mut self) -> ArrayVec<DemiBuffer, RECEIVE_BATCH_SIZE> {
         // TODO: This routine contains an extra copy of the entire incoming packet that could potentially be removed.
 
         // TODO: change this function to operate directly on DemiBuffer rather than on MaybeUninit<u8>.
@@ -69,7 +75,7 @@ impl<const N: usize> NetworkRuntime<N> for LinuxRuntime {
         let mut out: [MaybeUninit<u8>; limits::RECVBUF_SIZE_MAX] =
             [unsafe { MaybeUninit::uninit().assume_init() }; limits::RECVBUF_SIZE_MAX];
         if let Ok((nbytes, _origin_addr)) = self.socket.recvfrom(&mut out[..]) {
-            let mut ret: ArrayVec<DemiBuffer, N> = ArrayVec::new();
+            let mut ret: ArrayVec<DemiBuffer, RECEIVE_BATCH_SIZE> = ArrayVec::new();
             unsafe {
                 let bytes: [u8; limits::RECVBUF_SIZE_MAX] =
                     mem::transmute::<[MaybeUninit<u8>; limits::RECVBUF_SIZE_MAX], [u8; limits::RECVBUF_SIZE_MAX]>(out);
@@ -82,5 +88,18 @@ impl<const N: usize> NetworkRuntime<N> for LinuxRuntime {
         } else {
             ArrayVec::new()
         }
+    }
+
+    /// Configs
+    fn get_arp_config(&self) -> ArpConfig {
+        self.arp_config.clone()
+    }
+
+    fn get_tcp_config(&self) -> TcpConfig {
+        self.tcp_config.clone()
+    }
+
+    fn get_udp_config(&self) -> UdpConfig {
+        self.udp_config.clone()
     }
 }

@@ -6,7 +6,7 @@
 //======================================================================================================================
 
 use crate::{
-    collections::async_queue::AsyncQueue,
+    collections::async_queue::SharedAsyncQueue,
     inetstack::protocols::{
         arp::SharedArpPeer,
         ethernet2::{
@@ -34,23 +34,18 @@ use crate::{
     },
     runtime::{
         fail::Fail,
+        memory::DemiBuffer,
         network::{
             config::TcpConfig,
             types::MacAddress,
             NetworkRuntime,
         },
-        scheduler::Yielder,
         QDesc,
-        SharedBox,
         SharedDemiRuntime,
         SharedObject,
     },
 };
-use ::futures::{
-    channel::mpsc,
-    future::FutureExt,
-    select_biased,
-};
+use ::futures::channel::mpsc;
 use ::std::{
     convert::TryInto,
     net::SocketAddrV4,
@@ -64,33 +59,36 @@ use ::std::{
 // Structures
 //======================================================================================================================
 
-pub struct ActiveOpenSocket<const N: usize> {
+pub struct ActiveOpenSocket<N: NetworkRuntime> {
     local_isn: SeqNumber,
     local: SocketAddrV4,
     remote: SocketAddrV4,
     runtime: SharedDemiRuntime,
-    transport: SharedBox<dyn NetworkRuntime<N>>,
+    transport: N,
+    recv_queue: SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)>,
+    ack_queue: SharedAsyncQueue<usize>,
     local_link_addr: MacAddress,
     tcp_config: TcpConfig,
     arp: SharedArpPeer<N>,
     dead_socket_tx: mpsc::UnboundedSender<QDesc>,
-    recv_queue: AsyncQueue<TcpHeader>,
 }
 
 #[derive(Clone)]
-pub struct SharedActiveOpenSocket<const N: usize>(SharedObject<ActiveOpenSocket<N>>);
+pub struct SharedActiveOpenSocket<N: NetworkRuntime>(SharedObject<ActiveOpenSocket<N>>);
 
 //======================================================================================================================
 // Associated Functions
 //======================================================================================================================
 
-impl<const N: usize> SharedActiveOpenSocket<N> {
+impl<N: NetworkRuntime> SharedActiveOpenSocket<N> {
     pub fn new(
         local_isn: SeqNumber,
         local: SocketAddrV4,
         remote: SocketAddrV4,
         runtime: SharedDemiRuntime,
-        transport: SharedBox<dyn NetworkRuntime<N>>,
+        transport: N,
+        recv_queue: SharedAsyncQueue<(Ipv4Header, TcpHeader, DemiBuffer)>,
+        ack_queue: SharedAsyncQueue<usize>,
         tcp_config: TcpConfig,
         local_link_addr: MacAddress,
         arp: SharedArpPeer<N>,
@@ -104,17 +102,13 @@ impl<const N: usize> SharedActiveOpenSocket<N> {
             remote,
             runtime: runtime.clone(),
             transport,
+            recv_queue,
+            ack_queue,
             local_link_addr,
             tcp_config,
             arp,
             dead_socket_tx,
-            recv_queue: AsyncQueue::<TcpHeader>::default(),
         })))
-    }
-
-    pub fn receive(&mut self, header: TcpHeader) {
-        trace!("active_open::receive");
-        self.recv_queue.push(header);
     }
 
     fn process_ack(&mut self, header: TcpHeader) -> Result<EstablishedSocket<N>, Fail> {
@@ -210,11 +204,13 @@ impl<const N: usize> SharedActiveOpenSocket<N> {
             "Window scale: local {}, remote {}",
             local_window_scale, remote_window_scale
         );
-        Ok(EstablishedSocket::<N>::new(
+        Ok(EstablishedSocket::new(
             self.local,
             self.remote,
             self.runtime.clone(),
             self.transport.clone(),
+            self.recv_queue.clone(),
+            self.ack_queue.clone(),
             self.local_link_addr,
             self.tcp_config.clone(),
             self.arp.clone(),
@@ -232,14 +228,14 @@ impl<const N: usize> SharedActiveOpenSocket<N> {
         )?)
     }
 
-    pub async fn connect(mut self, yielder: Yielder) -> Result<EstablishedSocket<N>, Fail> {
+    pub async fn connect(mut self) -> Result<EstablishedSocket<N>, Fail> {
         // Start connection handshake.
         let handshake_retries: usize = self.tcp_config.get_handshake_retries();
         let handshake_timeout = self.tcp_config.get_handshake_timeout();
         for _ in 0..handshake_retries {
             // Look up remote MAC address.
             // TODO: Do we need to do this every iteration?
-            let remote_link_addr = match self.clone().arp.query(self.remote.ip().clone(), &yielder).await {
+            let remote_link_addr = match self.clone().arp.query(self.remote.ip().clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("ARP query failed: {:?}", e);
@@ -272,27 +268,17 @@ impl<const N: usize> SharedActiveOpenSocket<N> {
             self.transport.transmit(Box::new(segment));
 
             // Wait for either a response or timeout.
-            let yielder2: Yielder = Yielder::new();
-            let timeout_future = self.runtime.get_timer().wait(handshake_timeout, &yielder2).fuse();
-            let mut me: Self = self.clone();
-            let ack_future = me.recv_queue.pop(&yielder).fuse();
-            futures::pin_mut!(timeout_future);
-            futures::pin_mut!(ack_future);
-            select_biased! {
-                // If we received a response, process the response and either finish setting up the connection or try
-                // again.
-                result = ack_future => match result {
-                    Ok(header) => match self.process_ack(header) {
-                        Ok(socket) => return Ok(socket),
-                        Err(Fail{errno, cause:_}) if errno == libc::EAGAIN => continue,
-                        Err(e) => return Err(e),
-                    },
+            match self.recv_queue.pop(Some(handshake_timeout)).await {
+                Ok((_, header, _)) => match self.process_ack(header) {
+                    Ok(socket) => return Ok(socket),
+                    Err(Fail { errno, cause: _ }) if errno == libc::EAGAIN => continue,
                     Err(e) => return Err(e),
                 },
-                // If timeout, then we try again unless this coroutine has been canceled.
-                result = timeout_future => match result {
-                    Ok(()) => continue,
-                    Err(e) => return Err(e),
+                Err(Fail { errno, cause: _ }) if errno == libc::ETIMEDOUT => continue,
+                Err(_) => {
+                    unreachable!(
+                        "either the ack deadline changed or the deadline passed, no other errors are possible!"
+                    )
                 },
             }
         }
@@ -312,7 +298,7 @@ impl<const N: usize> SharedActiveOpenSocket<N> {
 // Trait Implementations
 //======================================================================================================================
 
-impl<const N: usize> Deref for SharedActiveOpenSocket<N> {
+impl<N: NetworkRuntime> Deref for SharedActiveOpenSocket<N> {
     type Target = ActiveOpenSocket<N>;
 
     fn deref(&self) -> &Self::Target {
@@ -320,7 +306,7 @@ impl<const N: usize> Deref for SharedActiveOpenSocket<N> {
     }
 }
 
-impl<const N: usize> DerefMut for SharedActiveOpenSocket<N> {
+impl<N: NetworkRuntime> DerefMut for SharedActiveOpenSocket<N> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0.deref_mut()
     }

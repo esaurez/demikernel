@@ -10,6 +10,7 @@ pub mod consts;
 pub mod ephemeral;
 pub mod ring;
 pub mod socket;
+pub mod transport;
 pub mod types;
 
 //======================================================================================================================
@@ -17,8 +18,19 @@ pub mod types;
 //======================================================================================================================
 
 use crate::runtime::{
-    memory::DemiBuffer,
-    network::socket::SocketId,
+    memory::{
+        DemiBuffer,
+        MemoryRuntime,
+    },
+    network::{
+        config::{
+            ArpConfig,
+            TcpConfig,
+            UdpConfig,
+        },
+        consts::RECEIVE_BATCH_SIZE,
+        socket::SocketId,
+    },
     Fail,
     QDesc,
 };
@@ -112,10 +124,17 @@ pub trait PacketBuf {
 }
 
 /// Network Runtime
-pub trait NetworkRuntime<const N: usize> {
+pub trait NetworkRuntime: Clone + 'static + MemoryRuntime {
     /// Transmits a single [PacketBuf].
     fn transmit(&mut self, pkt: Box<dyn PacketBuf>);
 
     /// Receives a batch of [DemiBuffer].
-    fn receive(&mut self) -> ArrayVec<DemiBuffer, N>;
+    fn receive(&mut self) -> ArrayVec<DemiBuffer, RECEIVE_BATCH_SIZE>;
+
+    /// Gets the UDP config options.
+    fn get_udp_config(&self) -> UdpConfig;
+
+    fn get_tcp_config(&self) -> TcpConfig;
+
+    fn get_arp_config(&self) -> ArpConfig;
 }

@@ -3,12 +3,8 @@
 
 #![cfg_attr(feature = "strict", deny(clippy:all))]
 #![recursion_limit = "512"]
-#![feature(atomic_from_mut)]
-#![feature(never_type)]
 #![feature(test)]
-#![feature(type_alias_impl_trait)]
 #![feature(allocator_api)]
-#![feature(slice_ptr_get)]
 #![feature(strict_provenance)]
 #![cfg_attr(target_os = "windows", feature(maybe_uninit_uninit_array))]
 
@@ -43,9 +39,6 @@ mod catnip;
 #[cfg(feature = "catpowder-libos")]
 mod catpowder;
 
-#[cfg(feature = "catcollar-libos")]
-mod catcollar;
-
 #[cfg(all(feature = "catnap-libos"))]
 mod catnap;
 
@@ -75,6 +68,11 @@ pub use crate::runtime::{
 };
 
 pub mod demikernel;
+
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 //======================================================================================================================
 // Macros

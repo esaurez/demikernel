@@ -3,11 +3,6 @@
 
 pub mod engine;
 pub mod runtime;
-
-pub use self::{
-    engine::SharedEngine,
-    runtime::SharedTestRuntime,
-};
 use crate::runtime::network::{
     config::{
         ArpConfig,
@@ -24,6 +19,8 @@ use ::std::{
         Instant,
     },
 };
+pub use engine::SharedEngine;
+pub use runtime::SharedTestRuntime;
 
 //==============================================================================
 // Constants
@@ -41,7 +38,7 @@ pub const CARRIE_IPV4: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 3);
 // Standalone Functions
 //==============================================================================
 
-pub fn new_alice<const N: usize>(now: Instant) -> SharedEngine<N> {
+pub fn new_alice(now: Instant) -> SharedEngine {
     let arp_config = ArpConfig::new(
         Some(Duration::from_secs(600)),
         Some(Duration::from_secs(1)),
@@ -51,12 +48,12 @@ pub fn new_alice<const N: usize>(now: Instant) -> SharedEngine<N> {
     );
     let udp_config: UdpConfig = UdpConfig::default();
     let tcp_config: TcpConfig = TcpConfig::default();
-    let test_rig: SharedTestRuntime =
+    let network: SharedTestRuntime =
         SharedTestRuntime::new(now, arp_config, udp_config, tcp_config, ALICE_MAC, ALICE_IPV4);
-    SharedEngine::new(test_rig).unwrap()
+    SharedEngine::new(network, now).unwrap()
 }
 
-pub fn new_bob<const N: usize>(now: Instant) -> SharedEngine<N> {
+pub fn new_bob(now: Instant) -> SharedEngine {
     let arp_config = ArpConfig::new(
         Some(Duration::from_secs(600)),
         Some(Duration::from_secs(1)),
@@ -66,11 +63,11 @@ pub fn new_bob<const N: usize>(now: Instant) -> SharedEngine<N> {
     );
     let udp_config = UdpConfig::default();
     let tcp_config = TcpConfig::default();
-    let test_rig = SharedTestRuntime::new(now, arp_config, udp_config, tcp_config, BOB_MAC, BOB_IPV4);
-    SharedEngine::new(test_rig).unwrap()
+    let network = SharedTestRuntime::new(now, arp_config, udp_config, tcp_config, BOB_MAC, BOB_IPV4);
+    SharedEngine::new(network, now).unwrap()
 }
 
-pub fn new_alice2<const N: usize>(now: Instant) -> SharedEngine<N> {
+pub fn new_alice2(now: Instant) -> SharedEngine {
     let mut arp: HashMap<Ipv4Addr, MacAddress> = HashMap::<Ipv4Addr, MacAddress>::new();
     arp.insert(ALICE_IPV4, ALICE_MAC);
     arp.insert(BOB_IPV4, BOB_MAC);
@@ -83,11 +80,11 @@ pub fn new_alice2<const N: usize>(now: Instant) -> SharedEngine<N> {
     );
     let udp_config = UdpConfig::default();
     let tcp_config = TcpConfig::default();
-    let test_rig = SharedTestRuntime::new(now, arp_config, udp_config, tcp_config, ALICE_MAC, ALICE_IPV4);
-    SharedEngine::new(test_rig).unwrap()
+    let network = SharedTestRuntime::new(now, arp_config, udp_config, tcp_config, ALICE_MAC, ALICE_IPV4);
+    SharedEngine::new(network, now).unwrap()
 }
 
-pub fn new_bob2<const N: usize>(now: Instant) -> SharedEngine<N> {
+pub fn new_bob2(now: Instant) -> SharedEngine {
     let mut arp: HashMap<Ipv4Addr, MacAddress> = HashMap::<Ipv4Addr, MacAddress>::new();
     arp.insert(BOB_IPV4, BOB_MAC);
     arp.insert(ALICE_IPV4, ALICE_MAC);
@@ -100,11 +97,11 @@ pub fn new_bob2<const N: usize>(now: Instant) -> SharedEngine<N> {
     );
     let udp_config = UdpConfig::default();
     let tcp_config = TcpConfig::default();
-    let test_rig = SharedTestRuntime::new(now, arp_config, udp_config, tcp_config, BOB_MAC, BOB_IPV4);
-    SharedEngine::new(test_rig).unwrap()
+    let network = SharedTestRuntime::new(now, arp_config, udp_config, tcp_config, BOB_MAC, BOB_IPV4);
+    SharedEngine::new(network, now).unwrap()
 }
 
-pub fn new_carrie<const N: usize>(now: Instant) -> SharedEngine<N> {
+pub fn new_carrie(now: Instant) -> SharedEngine {
     let arp_config = ArpConfig::new(
         Some(Duration::from_secs(600)),
         Some(Duration::from_secs(1)),
@@ -115,6 +112,6 @@ pub fn new_carrie<const N: usize>(now: Instant) -> SharedEngine<N> {
     let udp_config = UdpConfig::default();
     let tcp_config = TcpConfig::default();
 
-    let test_rig = SharedTestRuntime::new(now, arp_config, udp_config, tcp_config, CARRIE_MAC, CARRIE_IPV4);
-    SharedEngine::new(test_rig).unwrap()
+    let network = SharedTestRuntime::new(now, arp_config, udp_config, tcp_config, CARRIE_MAC, CARRIE_IPV4);
+    SharedEngine::new(network, now).unwrap()
 }

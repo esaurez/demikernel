@@ -8,8 +8,17 @@
 use ::arrayvec::ArrayVec;
 use ::crossbeam_channel;
 use ::demikernel::runtime::{
-    memory::DemiBuffer,
+    memory::{
+        DemiBuffer,
+        MemoryRuntime,
+    },
     network::{
+        config::{
+            ArpConfig,
+            TcpConfig,
+            UdpConfig,
+        },
+        consts::RECEIVE_BATCH_SIZE,
         NetworkRuntime,
         PacketBuf,
     },
@@ -32,6 +41,12 @@ pub struct DummyRuntime {
     incoming: crossbeam_channel::Receiver<DemiBuffer>,
     /// Outgoing Queue of Packets
     outgoing: crossbeam_channel::Sender<DemiBuffer>,
+    /// ARP config.
+    arp_config: ArpConfig,
+    /// TCP config.
+    tcp_config: TcpConfig,
+    /// UDP config.
+    udp_config: UdpConfig,
 }
 
 #[derive(Clone)]
@@ -49,8 +64,17 @@ impl SharedDummyRuntime {
     pub fn new(
         incoming: crossbeam_channel::Receiver<DemiBuffer>,
         outgoing: crossbeam_channel::Sender<DemiBuffer>,
+        arp_config: ArpConfig,
+        tcp_config: TcpConfig,
+        udp_config: UdpConfig,
     ) -> Self {
-        Self(SharedObject::new(DummyRuntime { incoming, outgoing }))
+        Self(SharedObject::new(DummyRuntime {
+            incoming,
+            outgoing,
+            arp_config,
+            tcp_config,
+            udp_config,
+        }))
     }
 }
 
@@ -59,7 +83,7 @@ impl SharedDummyRuntime {
 //==============================================================================
 
 /// Network Runtime Trait Implementation for Dummy Runtime
-impl<const N: usize> NetworkRuntime<N> for SharedDummyRuntime {
+impl NetworkRuntime for SharedDummyRuntime {
     fn transmit(&mut self, pkt: Box<dyn PacketBuf>) {
         let header_size: usize = pkt.header_size();
         let body_size: usize = pkt.body_size();
@@ -76,14 +100,28 @@ impl<const N: usize> NetworkRuntime<N> for SharedDummyRuntime {
         self.outgoing.try_send(buf).unwrap();
     }
 
-    fn receive(&mut self) -> ArrayVec<DemiBuffer, N> {
+    fn receive(&mut self) -> ArrayVec<DemiBuffer, RECEIVE_BATCH_SIZE> {
         let mut out = ArrayVec::new();
         if let Some(buf) = self.incoming.try_recv().ok() {
             out.push(buf);
         }
         out
     }
+
+    fn get_arp_config(&self) -> ArpConfig {
+        self.arp_config.clone()
+    }
+
+    fn get_tcp_config(&self) -> TcpConfig {
+        self.tcp_config.clone()
+    }
+
+    fn get_udp_config(&self) -> UdpConfig {
+        self.udp_config.clone()
+    }
 }
+
+impl MemoryRuntime for SharedDummyRuntime {}
 
 impl Deref for SharedDummyRuntime {
     type Target = DummyRuntime;

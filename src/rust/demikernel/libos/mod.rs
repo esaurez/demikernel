@@ -12,15 +12,26 @@ pub mod network;
 use self::{
     memory::MemoryLibOS,
     name::LibOSName,
-    network::NetworkLibOS,
+    network::NetworkLibOSWrapper,
 };
+#[cfg(feature = "catnip-libos")]
+use crate::catnip::runtime::SharedDPDKRuntime;
+#[cfg(feature = "catpowder-libos")]
+use crate::catpowder::runtime::LinuxRuntime;
+#[cfg(any(feature = "catpowder-libos", feature = "catnip-libos"))]
+use crate::inetstack::SharedInetStack;
+#[cfg(feature = "profiler")]
+use crate::timer;
+
 use crate::{
-    demikernel::config::Config,
+    demikernel::{
+        config::Config,
+        libos::network::libos::SharedNetworkLibOS,
+    },
     runtime::{
         fail::Fail,
         limits,
         logging,
-        scheduler::TaskHandle,
         types::{
             demi_qresult_t,
             demi_sgarray_t,
@@ -33,37 +44,27 @@ use crate::{
 use ::std::{
     env,
     net::SocketAddr,
-    time::{
-        Duration,
-        Instant,
-        SystemTime,
-    },
+    time::Duration,
 };
 
-#[cfg(feature = "catcollar-libos")]
-use crate::catcollar::CatcollarLibOS;
 #[cfg(feature = "catloop-libos")]
-use crate::catloop::SharedCatloopLibOS;
+use crate::catloop::transport::SharedCatloopTransport;
 #[cfg(feature = "catmem-libos")]
 use crate::catmem::SharedCatmemLibOS;
 #[cfg(all(feature = "catnap-libos"))]
-use crate::catnap::SharedCatnapLibOS;
-#[cfg(feature = "catnip-libos")]
-use crate::catnip::CatnipLibOS;
-#[cfg(feature = "catpowder-libos")]
-use crate::catpowder::CatpowderLibOS;
-
-#[cfg(feature = "profiler")]
-use crate::timer;
+use crate::catnap::transport::SharedCatnapTransport;
 
 //======================================================================================================================
 // Structures
 //======================================================================================================================
 
+// The following value was chosen arbitrarily.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// LibOS
 pub enum LibOS {
     /// Network LibOS
-    NetworkLibOS(NetworkLibOS),
+    NetworkLibOS(NetworkLibOSWrapper),
     /// Memory LibOS
     MemoryLibOS(MemoryLibOS),
 }
@@ -92,32 +93,55 @@ impl LibOS {
             },
         };
         let config: Config = Config::new(config_path);
-        let runtime: SharedDemiRuntime = SharedDemiRuntime::default();
+        let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
         // Instantiate LibOS.
         #[allow(unreachable_patterns)]
         let libos: LibOS = match libos_name {
             #[cfg(all(feature = "catnap-libos"))]
-            LibOSName::Catnap => {
-                Self::NetworkLibOS(NetworkLibOS::Catnap(SharedCatnapLibOS::new(&config, runtime.clone())))
-            },
-            #[cfg(feature = "catcollar-libos")]
-            LibOSName::Catcollar => {
-                Self::NetworkLibOS(NetworkLibOS::Catcollar(CatcollarLibOS::new(&config, runtime.clone())))
-            },
+            LibOSName::Catnap => Self::NetworkLibOS(NetworkLibOSWrapper::Catnap {
+                runtime: runtime.clone(),
+                libos: SharedNetworkLibOS::<SharedCatnapTransport>::new(
+                    runtime.clone(),
+                    SharedCatnapTransport::new(&config, &mut runtime),
+                ),
+            }),
             #[cfg(feature = "catpowder-libos")]
             LibOSName::Catpowder => {
-                Self::NetworkLibOS(NetworkLibOS::Catpowder(CatpowderLibOS::new(&config, runtime.clone())))
+                // TODO: Remove some of these clones once we are done merging the libOSes.
+                let transport: LinuxRuntime = LinuxRuntime::new(config.clone());
+                // This is our transport for Catpowder.
+                let inetstack: SharedInetStack<LinuxRuntime> =
+                    SharedInetStack::<LinuxRuntime>::new(config.clone(), runtime.clone(), transport).unwrap();
+                Self::NetworkLibOS(NetworkLibOSWrapper::Catpowder {
+                    runtime: runtime.clone(),
+                    libos: SharedNetworkLibOS::<SharedInetStack<LinuxRuntime>>::new(runtime.clone(), inetstack),
+                })
             },
             #[cfg(feature = "catnip-libos")]
-            LibOSName::Catnip => Self::NetworkLibOS(NetworkLibOS::Catnip(CatnipLibOS::new(&config, runtime.clone()))),
+            LibOSName::Catnip => {
+                // TODO: Remove some of these clones once we are done merging the libOSes.
+                let transport: SharedDPDKRuntime = SharedDPDKRuntime::new(config.clone())?;
+                let inetstack: SharedInetStack<SharedDPDKRuntime> =
+                    SharedInetStack::<SharedDPDKRuntime>::new(config.clone(), runtime.clone(), transport).unwrap();
+
+                Self::NetworkLibOS(NetworkLibOSWrapper::Catnip {
+                    runtime: runtime.clone(),
+                    libos: SharedNetworkLibOS::<SharedInetStack<SharedDPDKRuntime>>::new(runtime.clone(), inetstack),
+                })
+            },
             #[cfg(feature = "catmem-libos")]
-            LibOSName::Catmem => {
-                Self::MemoryLibOS(MemoryLibOS::Catmem(SharedCatmemLibOS::new(&config, runtime.clone())))
-            },
+            LibOSName::Catmem => Self::MemoryLibOS(MemoryLibOS::Catmem {
+                runtime: runtime.clone(),
+                libos: SharedCatmemLibOS::new(&config, runtime.clone()),
+            }),
             #[cfg(feature = "catloop-libos")]
-            LibOSName::Catloop => {
-                Self::NetworkLibOS(NetworkLibOS::Catloop(SharedCatloopLibOS::new(&config, runtime.clone())))
-            },
+            LibOSName::Catloop => Self::NetworkLibOS(NetworkLibOSWrapper::Catloop {
+                runtime: runtime.clone(),
+                libos: SharedNetworkLibOS::<SharedCatloopTransport>::new(
+                    runtime.clone(),
+                    SharedCatloopTransport::new(&config, runtime.clone()),
+                ),
+            }),
             _ => panic!("unsupported libos"),
         };
 
@@ -248,13 +272,26 @@ impl LibOS {
     }
 
     /// Closes an I/O queue.
+    /// async_close() + wait() achieves the same effect as synchronous close.
     pub fn close(&mut self, qd: QDesc) -> Result<(), Fail> {
         let result: Result<(), Fail> = {
             #[cfg(feature = "profiler")]
             timer!("demikernel::close");
             match self {
-                LibOS::NetworkLibOS(libos) => libos.close(qd),
-                LibOS::MemoryLibOS(libos) => libos.close(qd),
+                LibOS::NetworkLibOS(libos) => match libos.async_close(qd) {
+                    Ok(qt) => match self.wait(qt, None) {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                },
+                LibOS::MemoryLibOS(libos) => match libos.async_close(qd) {
+                    Ok(qt) => match self.wait(qt, None) {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                },
             }
         };
 
@@ -340,69 +377,21 @@ impl LibOS {
     /// Waits for a pending I/O operation to complete or a timeout to expire.
     /// This is just a single-token convenience wrapper for wait_any().
     pub fn wait(&mut self, qt: QToken, timeout: Option<Duration>) -> Result<demi_qresult_t, Fail> {
-        trace!("wait(): qt={:?}, timeout={:?}", qt, timeout);
-
-        // Put the QToken into a single element array.
-        let qt_array: [QToken; 1] = [qt];
-
-        // Call wait_any() to do the real work.
-        let (offset, qr): (usize, demi_qresult_t) = self.wait_any(&qt_array, timeout)?;
-        debug_assert_eq!(offset, 0);
-        Ok(qr)
-    }
-
-    /// Waits for an I/O operation to complete or a timeout to expire.
-    pub fn timedwait(&mut self, qt: QToken, abstime: Option<SystemTime>) -> Result<demi_qresult_t, Fail> {
-        trace!("timedwait() qt={:?}, timeout={:?}", qt, abstime);
-
-        // Retrieve associated schedule handle.
-        let handle: TaskHandle = self.schedule(qt)?;
-
-        loop {
-            // Poll first, so as to give pending operations a chance to complete.
-            self.poll();
-
-            // The operation has completed, so extract the result and return.
-            if handle.has_completed() {
-                return Ok(self.pack_result(handle, qt)?);
-            }
-
-            if abstime.is_none() || SystemTime::now() >= abstime.unwrap() {
-                return Err(Fail::new(libc::ETIMEDOUT, "timer expired"));
-            }
+        #[cfg(feature = "profiler")]
+        timer!("demikernel::wait");
+        match self {
+            LibOS::NetworkLibOS(libos) => libos.wait(qt, timeout.unwrap_or(DEFAULT_TIMEOUT)),
+            LibOS::MemoryLibOS(libos) => libos.wait(qt, timeout.unwrap_or(DEFAULT_TIMEOUT)),
         }
     }
 
     /// Waits for any of the given pending I/O operations to complete or a timeout to expire.
     pub fn wait_any(&mut self, qts: &[QToken], timeout: Option<Duration>) -> Result<(usize, demi_qresult_t), Fail> {
-        trace!("wait_any(): qts={:?}, timeout={:?}", qts, timeout);
-
-        // Get the wait start time, but only if we have a timeout.  We don't care when we started if we wait forever.
-        let start: Option<Instant> = if timeout.is_none() { None } else { Some(Instant::now()) };
-
-        loop {
-            // Poll first, so as to give pending operations a chance to complete.
-            self.poll();
-
-            // Search for any operation that has completed.
-            for (i, &qt) in qts.iter().enumerate() {
-                // Retrieve associated schedule handle.
-                // TODO: move this out of the loop.
-                let handle: TaskHandle = self.schedule(qt)?;
-
-                // Found one, so extract the result and return.
-                if handle.has_completed() {
-                    return Ok((i, self.pack_result(handle, qt)?));
-                }
-            }
-
-            // If we have a timeout, check for expiration.
-            if timeout.is_some()
-                && Instant::now().duration_since(start.expect("start should be set if timeout is"))
-                    > timeout.expect("timeout should still be set")
-            {
-                return Err(Fail::new(libc::ETIMEDOUT, "timer expired"));
-            }
+        #[cfg(feature = "profiler")]
+        timer!("demikernel::wait_any");
+        match self {
+            LibOS::NetworkLibOS(libos) => libos.wait_any(qts, timeout.unwrap_or(DEFAULT_TIMEOUT)),
+            LibOS::MemoryLibOS(libos) => libos.wait_any(qts, timeout.unwrap_or(DEFAULT_TIMEOUT)),
         }
     }
 
@@ -416,8 +405,6 @@ impl LibOS {
                 LibOS::MemoryLibOS(libos) => libos.sgaalloc(size),
             }
         };
-
-        self.poll();
 
         result
     }
@@ -433,27 +420,7 @@ impl LibOS {
             }
         };
 
-        self.poll();
-
         result
-    }
-
-    /// Waits for any operation in an I/O queue.
-    fn schedule(&mut self, qt: QToken) -> Result<TaskHandle, Fail> {
-        match self {
-            LibOS::NetworkLibOS(libos) => libos.schedule(qt),
-            LibOS::MemoryLibOS(libos) => libos.schedule(qt),
-        }
-    }
-
-    fn pack_result(&mut self, handle: TaskHandle, qt: QToken) -> Result<demi_qresult_t, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("demikernel::pack_result");
-
-        match self {
-            LibOS::NetworkLibOS(libos) => libos.pack_result(handle, qt),
-            LibOS::MemoryLibOS(libos) => libos.pack_result(handle, qt),
-        }
     }
 
     fn poll(&mut self) {

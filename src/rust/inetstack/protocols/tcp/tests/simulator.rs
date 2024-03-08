@@ -8,29 +8,49 @@
 use crate::{
     inetstack::{
         protocols::{
-            ethernet2::EtherType2,
+            ethernet2::{
+                EtherType2,
+                Ethernet2Header,
+            },
+            ip::IpProtocol,
+            ipv4::Ipv4Header,
             tcp::segment::{
+                TcpHeader,
                 TcpOptions2,
+                TcpSegment,
                 MAX_TCP_OPTIONS,
             },
         },
-        test_helpers::SharedTestRuntime,
-    },
-    runtime::network::{
-        config::{
-            ArpConfig,
-            TcpConfig,
-            UdpConfig,
+        test_helpers::{
+            self,
+            engine::{
+                SharedEngine,
+                DEFAULT_TIMEOUT,
+            },
+            runtime::SharedTestRuntime,
         },
-        consts::RECEIVE_BATCH_SIZE,
+    },
+    runtime::{
+        memory::DemiBuffer,
+        network::{
+            config::{
+                ArpConfig,
+                TcpConfig,
+                UdpConfig,
+            },
+            PacketBuf,
+        },
+        OperationResult,
     },
     MacAddress,
+    QDesc,
     QToken,
 };
 use anyhow::Result;
 use nettest::glue::{
     AcceptArgs,
     BindArgs,
+    CloseArgs,
     ConnectArgs,
     Event,
     ListenArgs,
@@ -64,29 +84,6 @@ use std::{
         Duration,
         Instant,
     },
-};
-
-use crate::{
-    inetstack::{
-        protocols::{
-            ethernet2::Ethernet2Header,
-            ip::IpProtocol,
-            ipv4::Ipv4Header,
-            tcp::segment::{
-                TcpHeader,
-                TcpSegment,
-            },
-        },
-        test_helpers::{
-            self,
-            SharedEngine,
-        },
-    },
-    runtime::{
-        memory::DemiBuffer,
-        network::PacketBuf,
-    },
-    QDesc,
 };
 
 //======================================================================================================================
@@ -182,7 +179,7 @@ struct Simulation {
     remote_port: u16,
     local_qd: Option<(u32, QDesc)>,
     remote_qd: Option<(u32, Option<QDesc>)>,
-    engine: SharedEngine<RECEIVE_BATCH_SIZE>,
+    engine: SharedEngine,
     now: Instant,
     inflight: Option<QToken>,
     steps: Vec<String>,
@@ -228,7 +225,7 @@ impl Simulation {
             local_mac.clone(),
             local_ipv4.clone(),
         );
-        let local: SharedEngine<RECEIVE_BATCH_SIZE> = SharedEngine::new(test_rig)?;
+        let local: SharedEngine = SharedEngine::new(test_rig, now)?;
 
         println!("Local: sockaddr={:?}, macaddr={:?}", local_ipv4, local_mac);
         println!("Remote: sockaddr={:?}, macaddr={:?}", remote_ipv4, remote_mac);
@@ -314,13 +311,22 @@ impl Simulation {
             }
         }
 
+        // Ensure that there are no more events to be processed.
+        let frames: VecDeque<DemiBuffer> = self.engine.pop_all_frames();
+        if !frames.is_empty() {
+            for frame in &frames {
+                eprintln!("run(): {:?}", frame);
+            }
+            anyhow::bail!("run(): unexpected outgoing frames");
+        }
+
         Ok(())
     }
 
     /// Runs an event.
     fn run_event(&mut self, event: &Event) -> Result<()> {
         self.now += event.time;
-        self.engine.get_test_rig().get_runtime().advance_clock(self.now);
+        self.engine.advance_clock(self.now);
         println!("=================");
 
         match &event.action {
@@ -344,15 +350,13 @@ impl Simulation {
             nettest::glue::DemikernelSyscall::Connect(args, ret) => self.run_connect_syscall(args, ret.clone())?,
             nettest::glue::DemikernelSyscall::Push(args, ret) => self.run_push_syscall(args, ret.clone())?,
             nettest::glue::DemikernelSyscall::Pop(ret) => self.run_pop_syscall(ret.clone())?,
+            nettest::glue::DemikernelSyscall::Wait(args, ret) => self.run_wait_syscall(args, ret.clone())?,
+            nettest::glue::DemikernelSyscall::Close(args, ret) => self.run_close_syscall(args, ret.clone())?,
             nettest::glue::DemikernelSyscall::Unsupported => {
                 eprintln!("Unsupported syscall");
             },
-            _ => {
-                eprintln!("Unimplemented syscall");
-            },
         }
 
-        self.engine.get_test_rig().poll_scheduler();
         Ok(())
     }
 
@@ -517,9 +521,7 @@ impl Simulation {
         match self.engine.tcp_accept(local_qd) {
             Ok(accept_qt) => {
                 self.remote_qd = Some((ret, None));
-
                 self.inflight = Some(accept_qt);
-
                 Ok(())
             },
             Err(err) if ret as i32 == err.errno => Ok(()),
@@ -595,6 +597,10 @@ impl Simulation {
         match self.engine.tcp_push(remote_qd, buf) {
             Ok(push_qt) => {
                 self.inflight = Some(push_qt);
+                // We need an extra poll because we now perform all work for the push inside the asynchronous coroutine.
+                // TODO: Remove this once we separate the poll and advance clock functions.
+                self.engine.poll();
+
                 Ok(())
             },
             Err(err) if ret as i32 == err.errno => Ok(()),
@@ -625,6 +631,72 @@ impl Simulation {
             _ => {
                 let cause: String = format!("unexpected return for pop syscall");
                 eprintln!("run_pop_syscall(): ret={:?}", ret);
+                anyhow::bail!(cause);
+            },
+        }
+    }
+
+    /// Emulates wait system call.
+    fn run_wait_syscall(&mut self, args: &nettest::glue::WaitArgs, ret: u32) -> Result<()> {
+        // Extract queue descriptor.
+        let args_qd: QDesc = match args.qd {
+            Some(qd) => QDesc::from(qd),
+            None => {
+                let cause: String = format!("queue descriptor must be informed");
+                eprintln!("run_wait_syscall(): {:?}", cause);
+                anyhow::bail!(cause);
+            },
+        };
+
+        match self.operation_has_completed() {
+            Ok((qd, qr)) if args_qd == qd => match qr {
+                crate::OperationResult::Accept((remote_qd, remote_addr)) if ret == 0 => {
+                    eprintln!("connection accepted (qd={:?}, addr={:?})", qd, remote_addr);
+                    self.remote_qd = Some((self.remote_qd.unwrap().0, Some(remote_qd)));
+                    Ok(())
+                },
+                crate::OperationResult::Connect => {
+                    eprintln!("connection established as expected (qd={:?})", qd);
+                    Ok(())
+                },
+                crate::OperationResult::Pop(_sockaddr, _data) => {
+                    eprintln!("pop completed as expected (qd={:?})", qd);
+                    Ok(())
+                },
+                crate::OperationResult::Push => {
+                    eprintln!("push completed as expected (qd={:?})", qd);
+                    Ok(())
+                },
+                crate::OperationResult::Close => {
+                    eprintln!("close completed as expected (qd={:?})", qd);
+                    Ok(())
+                },
+                crate::OperationResult::Failed(e) if e.errno == ret as i32 => {
+                    eprintln!("operation failed as expected (qd={:?}, errno={:?})", qd, e.errno);
+                    Ok(())
+                },
+                crate::OperationResult::Failed(e) => {
+                    unreachable!("operation failed unexpectedly (qd={:?}, errno={:?})", qd, e.errno);
+                },
+                _ => unreachable!("unexpected operation has completed coroutine has completed"),
+            },
+            _ => unreachable!("no operation has completed coroutine has completed, but it should"),
+        }
+    }
+
+    fn run_close_syscall(&mut self, args: &CloseArgs, ret: u32) -> Result<()> {
+        // Extract queue descriptor.
+        let args_qd: QDesc = args.qd.into();
+
+        match self.engine.tcp_async_close(args_qd) {
+            Ok(close_qt) => {
+                self.inflight = Some(close_qt);
+                Ok(())
+            },
+            Err(err) if ret as i32 == err.errno => Ok(()),
+            _ => {
+                let cause: String = format!("unexpected return for close syscall");
+                eprintln!("run_close_syscall(): ret={:?}", ret);
                 anyhow::bail!(cause);
             },
         }
@@ -740,33 +812,7 @@ impl Simulation {
         let buf: DemiBuffer = Self::serialize_segment(segment);
         self.engine.receive(buf)?;
 
-        self.engine.get_test_rig().poll_scheduler();
-
-        if let Ok(Some(qt)) = self.operation_has_completed() {
-            match self
-                .engine
-                .get_test_rig()
-                .get_runtime()
-                .remove_coroutine_with_qtoken(qt)
-                .get_result()
-            {
-                Some((qd, qr)) => match qr {
-                    crate::OperationResult::Accept((remote_qd, remote_addr)) => {
-                        eprintln!("connection accepted (qd={:?}, addr={:?})", qd, remote_addr);
-                        self.remote_qd = Some((self.remote_qd.unwrap().0, Some(remote_qd)));
-                    },
-                    crate::OperationResult::Connect => {
-                        eprintln!("connection established (qd={:?})", qd);
-                    },
-                    crate::OperationResult::Pop(_sockaddr, _data) => {
-                        eprintln!("pop completed (qd={:?})", qd);
-                    },
-                    _ => unreachable!("unexpected operation has completed coroutine has completed"),
-                },
-                _ => unreachable!("no operation has completed coroutine has completed, but it should"),
-            }
-        }
-
+        self.engine.poll();
         Ok(())
     }
 
@@ -850,61 +896,41 @@ impl Simulation {
     }
 
     /// Checks if an operation has completed.
-    fn operation_has_completed(&mut self) -> Result<Option<QToken>> {
-        let has_completed: bool = match self.inflight {
-            Some(qt) => match self.engine.get_test_rig().get_runtime().from_task_id(qt.clone()) {
-                Ok(task_handle) => task_handle.has_completed(),
-                Err(e) => anyhow::bail!("{:?}", e),
-            },
+    fn operation_has_completed(&mut self) -> Result<(QDesc, OperationResult)> {
+        match self.inflight.take() {
+            Some(qt) => Ok(self.engine.wait(qt, DEFAULT_TIMEOUT)?),
             None => anyhow::bail!("should have an inflight queue token"),
-        };
-        if has_completed {
-            Ok(Some(self.inflight.take().unwrap()))
-        } else {
-            Ok(None)
         }
     }
 
     /// Runs an outgoing packet.
     fn run_outgoing_packet(&mut self, tcp_packet: &TcpPacket) -> Result<()> {
-        self.engine.get_test_rig().poll_scheduler();
-
-        let frames: VecDeque<DemiBuffer> = self.engine.get_test_rig().pop_all_frames();
-
-        // FIXME: We currently do not support multi-frame segments.
-        crate::ensure_eq!(frames.len(), 1);
-
-        for bytes in &frames {
-            let (eth2_header, eth2_payload) = Ethernet2Header::parse(bytes.clone())?;
-            self.check_ethernet2_header(&eth2_header)?;
-
-            let (ipv4_header, ipv4_payload) = Ipv4Header::parse(eth2_payload)?;
-            self.check_ipv4_header(&ipv4_header)?;
-
-            let (tcp_header, _) = TcpHeader::parse(&ipv4_header, ipv4_payload, true)?;
-            self.check_tcp_header(&tcp_header, &tcp_packet)?;
-        }
-
-        if let Ok(Some(qt)) = self.operation_has_completed() {
-            match self
-                .engine
-                .get_test_rig()
-                .get_runtime()
-                .remove_coroutine_with_qtoken(qt)
-                .get_result()
-            {
-                Some((qd, qr)) => match qr {
-                    crate::OperationResult::Accept(_) => {
-                        anyhow::bail!("accept should complete on incoming packet (qd={:?})", qd);
-                    },
-                    crate::OperationResult::Push => {
-                        warn!("push should not complete, untill the remote has acknowledged sent data");
-                    },
-                    _ => unreachable!("unexpected operation has completed coroutine has completed"),
-                },
-                _ => unreachable!("no operation has completed coroutine has completed, but it should"),
+        let mut n = 0;
+        let frames = loop {
+            let frames = self.engine.pop_all_frames();
+            if frames.is_empty() {
+                if n > 5 {
+                    anyhow::bail!("did not emit a frame after 5 loops");
+                } else {
+                    self.engine.poll();
+                    n += 1;
+                }
+            } else {
+                // FIXME: We currently do not support multi-frame segments.
+                crate::ensure_eq!(frames.len(), 1);
+                break frames;
             }
-        }
+        };
+        let bytes = &frames[0];
+        let (eth2_header, eth2_payload) = Ethernet2Header::parse(bytes.clone())?;
+        self.check_ethernet2_header(&eth2_header)?;
+
+        let (ipv4_header, ipv4_payload) = Ipv4Header::parse(eth2_payload)?;
+        self.check_ipv4_header(&ipv4_header)?;
+
+        let (tcp_header, tcp_payload) = TcpHeader::parse(&ipv4_header, ipv4_payload, true)?;
+        crate::ensure_eq!(tcp_packet.seqnum.win as usize, tcp_payload.len());
+        self.check_tcp_header(&tcp_header, &tcp_packet)?;
 
         Ok(())
     }

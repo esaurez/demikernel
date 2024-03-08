@@ -5,6 +5,7 @@
 // Imports
 //======================================================================================================================
 
+use crate::DEFAULT_TIMEOUT;
 use anyhow::Result;
 use demikernel::{
     demi_sgarray_t,
@@ -99,7 +100,7 @@ impl TcpEchoClient {
             let sockqd: QDesc = self.libos.socket(AF_INET, SOCK_STREAM, 0)?;
             self.clients.insert(sockqd, (vec![0; self.bufsize], 0));
             let qt: QToken = self.libos.connect(sockqd, self.remote)?;
-            let qr: demi_qresult_t = self.libos.wait(qt, None)?;
+            let qr: demi_qresult_t = self.libos.wait(qt, Some(DEFAULT_TIMEOUT))?;
             if qr.qr_opcode != demi_opcode_t::DEMI_OPC_CONNECT {
                 anyhow::bail!("failed to connect to server")
             }
@@ -113,13 +114,18 @@ impl TcpEchoClient {
         loop {
             // Stop: enough packets were echoed.
             if let Some(nrequests) = nrequests {
-                if self.nechoed >= nrequests {
+                if self.nbytes >= nclients * self.bufsize * nrequests {
+                    println!("INFO: stopping, {} bytes transferred", self.nbytes);
                     break;
                 }
             }
 
-            // Stop: all clients ere disconnected.
+            // Stop: all clients were disconnected.
             if self.clients.len() == 0 {
+                println!(
+                    "INFO: stopping, all clients disconnected {} bytes transferred",
+                    self.nbytes
+                );
                 break;
             }
 
@@ -135,7 +141,7 @@ impl TcpEchoClient {
             }
 
             let qr: demi_qresult_t = {
-                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
+                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, Some(DEFAULT_TIMEOUT))?;
                 self.unregister_operation(index)?;
                 qr
             };
@@ -179,7 +185,7 @@ impl TcpEchoClient {
             // First client connects synchronously.
             if i == 0 {
                 let qr: demi_qresult_t = {
-                    let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
+                    let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, Some(DEFAULT_TIMEOUT))?;
                     self.unregister_operation(index)?;
                     qr
                 };
@@ -199,13 +205,18 @@ impl TcpEchoClient {
         loop {
             // Stop: enough packets were echoed.
             if let Some(nrequests) = nrequests {
-                if self.nechoed >= nrequests {
+                if self.nbytes >= nclients * self.bufsize * nrequests {
+                    println!("INFO: stopping, {} bytes transferred", self.nbytes);
                     break;
                 }
             }
 
-            // Stop: all clients ere disconnected.
+            // Stop: all clients were disconnected.
             if self.clients.len() == 0 {
+                println!(
+                    "INFO: stopping, all clients disconnected {} bytes transferred",
+                    self.nbytes
+                );
                 break;
             }
 
@@ -221,7 +232,7 @@ impl TcpEchoClient {
             }
 
             let qr: demi_qresult_t = {
-                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
+                let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, Some(DEFAULT_TIMEOUT))?;
                 self.unregister_operation(index)?;
                 qr
             };

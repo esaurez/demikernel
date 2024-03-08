@@ -129,7 +129,6 @@ impl ConcurrentRingBuffer {
         timer!("collections::concurrent_ring::remaining_capacity");
         let push_offset: usize = peek(self.push_offset);
         let pop_offset: usize = peek(self.pop_offset);
-        //println!("{:?} {:?}", push_offset, pop_offset);
         self.available_space(push_offset, pop_offset)
     }
 
@@ -274,7 +273,7 @@ impl ConcurrentRingBuffer {
         assert!(offset % 2 == 0);
         let buffer_ptr: *mut u8 = unsafe { self.buffer.get_mut() }.as_mut_ptr();
         let header_ptr: *mut u16 = unsafe { buffer_ptr.add(offset) } as *mut u16;
-        let header: &AtomicU16 = AtomicU16::from_mut(unsafe { &mut *header_ptr });
+        let header: &AtomicU16 = unsafe { &*header_ptr.cast() };
         header.swap(val as u16, atomic::Ordering::Relaxed) as usize
     }
 
@@ -427,14 +426,14 @@ impl Ring for ConcurrentRingBuffer {
 
 /// Peeks at the value at [ptr] to check various constraints.
 fn peek(ptr: *mut usize) -> usize {
-    let ptr: &mut AtomicUsize = AtomicUsize::from_mut(unsafe { &mut *ptr });
+    let ptr: &AtomicUsize = unsafe { &*ptr.cast() };
     ptr.load(atomic::Ordering::Relaxed)
 }
 
 /// Compares and increments the value at [ptr] only if it has not changed since the last time we read it.
 fn check_and_set(ptr: *mut usize, current: usize, new: usize) -> Result<usize, usize> {
-    let ptr_: &mut AtomicUsize = AtomicUsize::from_mut(unsafe { &mut *ptr });
-    ptr_.compare_exchange_weak(current, new, atomic::Ordering::Acquire, atomic::Ordering::Relaxed)
+    let ptr: &AtomicUsize = unsafe { &*ptr.cast() };
+    ptr.compare_exchange_weak(current, new, atomic::Ordering::Acquire, atomic::Ordering::Relaxed)
 }
 
 /// Align to [HEADER_SIZE] for the header offset.
@@ -549,7 +548,7 @@ mod test {
             };
         }
 
-        println!("inserted {:?} elements", elements);
+        trace!("inserted {:?} elements", elements);
         // Check if buffer state is consistent.
         crate::ensure_eq!(ring.is_empty(), false);
 
@@ -663,7 +662,7 @@ mod test {
             (seqnum, tid)
         }
 
-        println!(
+        trace!(
             "starting {} writers and {} readers",
             NUMBER_OF_THREADS / 2,
             NUMBER_OF_THREADS / 2
@@ -683,7 +682,7 @@ mod test {
                         let self_tid: u8 = thread::current().name().unwrap().parse::<u8>().unwrap();
                         let peer_tid: u8 = self_tid + 1;
 
-                        println!("writer: started");
+                        trace!("writer: started");
                         while seqnum <= NUMBER_OF_ITERATIONS {
                             // Cook message.
                             cook_message(&mut buf[..], seqnum, peer_tid);
@@ -692,9 +691,11 @@ mod test {
                                 // Push message.
                                 push_message(&writer_ring, &buf[..]);
 
-                                println!(
+                                trace!(
                                     "writer: sent (seqnum={:?}/{:?}, tid={:?})",
-                                    seqnum, NUMBER_OF_ITERATIONS, peer_tid
+                                    seqnum,
+                                    NUMBER_OF_ITERATIONS,
+                                    peer_tid
                                 );
 
                                 // Pop message.
@@ -706,17 +707,17 @@ mod test {
                                 // Extract peer ID and sequence number.
                                 let (recv_seqnum, recv_tid): (u8, u8) = parse_message(&buf[..]);
 
-                                println!("writer: ack received (seqnum={:?}, tid={})", recv_seqnum, recv_tid);
+                                trace!("writer: ack received (seqnum={:?}, tid={})", recv_seqnum, recv_tid);
 
                                 // Check whether or not this thread is the intended recipient for this message.
                                 if recv_tid != self_tid {
-                                    println!("writer: dropping message (seqnum={}, bad recipient)", recv_seqnum);
+                                    trace!("writer: dropping message (seqnum={}, bad recipient)", recv_seqnum);
                                     continue;
                                 }
 
                                 // Check whether or not if sequence number matches what we expect.
                                 if recv_seqnum != seqnum {
-                                    println!("writer: dropping message (seqnum={}, malformed)", seqnum);
+                                    trace!("writer: dropping message (seqnum={}, malformed)", seqnum);
                                     continue;
                                 }
 
@@ -731,7 +732,7 @@ mod test {
 
                             seqnum = seqnum + 1;
                         }
-                        println!("writer: done");
+                        trace!("writer: done");
                     })
                     .unwrap();
 
@@ -744,7 +745,7 @@ mod test {
                         let self_tid: u8 = thread::current().name().unwrap().parse::<u8>().unwrap();
                         let peer_tid: u8 = self_tid - 1;
 
-                        println!("reader: started");
+                        trace!("reader: started");
                         while next_seqnum <= NUMBER_OF_ITERATIONS {
                             // Pop message.
                             if pop_message_timeout(&writer_ring, &mut buf[..]).is_err() {
@@ -755,23 +756,23 @@ mod test {
                             // Extract peer ID and sequence number.
                             let (recv_seqnum, recv_tid): (u8, u8) = parse_message(&buf[..]);
 
-                            println!("reader: received (seqnum={}, tid={})", recv_seqnum, recv_tid);
+                            trace!("reader: received (seqnum={}, tid={})", recv_seqnum, recv_tid);
 
                             // Check whether or not this thread is the intended recipient for this message.
                             if recv_tid != self_tid {
-                                println!("reader: dropping message (seqnum={}, bad recipient)", recv_seqnum);
+                                trace!("reader: dropping message (seqnum={}, bad recipient)", recv_seqnum);
                                 continue;
                             }
 
                             // Check whether or not we received an old message.
                             if recv_seqnum < next_seqnum {
-                                println!("reader: dropping message (seqnum={}, old message)", recv_seqnum);
+                                trace!("reader: dropping message (seqnum={}, old message)", recv_seqnum);
                                 continue;
                             }
 
                             // Check whether or not we received a malformed message.
                             if check_message(&buf).is_err() {
-                                println!("reader: dropping message (seqnum={}, malformed)", recv_seqnum);
+                                trace!("reader: dropping message (seqnum={}, malformed)", recv_seqnum);
                                 continue;
                             }
 
@@ -786,7 +787,7 @@ mod test {
                             // Push message.
                             push_message(&reader_ring, &buf);
 
-                            println!("reader: ack (seqnum={}, tid={})", next_seqnum, recv_tid);
+                            trace!("reader: ack (seqnum={}, tid={})", next_seqnum, recv_tid);
                         }
                     })
                     .unwrap();

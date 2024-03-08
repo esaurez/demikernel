@@ -163,6 +163,18 @@ clean-examples-rust:
 	$(MAKE) -C examples/rust clean
 
 #=======================================================================================================================
+# Benchmarks
+#=======================================================================================================================
+
+# Builds all C benchmarks
+all-benchmarks-c: all-libs
+	$(MAKE) -C benchmarks all
+
+# Cleans up all C build artifacts for benchmarks.
+clean-benchmarks-c:
+	$(MAKE) -C benchmarks clean
+
+#=======================================================================================================================
 # Check
 #=======================================================================================================================
 
@@ -186,6 +198,8 @@ check-fmt-rust:
 clean: clean-examples clean-tests clean-libs
 
 #=======================================================================================================================
+# Tests
+#=======================================================================================================================
 
 export CONFIG_PATH ?= $(HOME)/config.yaml
 export MTU ?= 1500
@@ -193,6 +207,7 @@ export MSS ?= 1500
 export PEER ?= server
 export TEST ?= udp-push-pop
 export TEST_INTEGRATION ?= tcp-test
+export TEST_UNIT ?=
 export TIMEOUT ?= 120
 export IS_HOST ?= no
 export SHMEM_PATH ?= /ivshmem
@@ -212,16 +227,25 @@ test-unit-c: all-tests $(BINDIR)/syscalls.elf
 	timeout $(TIMEOUT) $(BINDIR)/syscalls.elf
 
 # Rust unit tests.
-test-unit-rust: all-tests-rust
-	timeout $(TIMEOUT) $(CARGO) test --lib $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture
-	timeout $(TIMEOUT) $(CARGO) test --test udp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture
-	timeout $(TIMEOUT) $(CARGO) test --test tcp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture
+test-unit-rust: test-unit-rust-lib test-unit-rust-udp test-unit-rust-tcp
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_single_small
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_tight_small
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_decoupled_small
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_single_big
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_tight_big
 	timeout $(TIMEOUT) $(CARGO) test --test sga $(BUILD) $(CARGO_FEATURES) -- --nocapture --test-threads=1 test_unit_sga_alloc_free_loop_decoupled_big
+
+# Rust unit tests for the library.
+test-unit-rust-lib: all-tests-rust
+	timeout $(TIMEOUT) $(CARGO) test --lib $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture $(TEST_UNIT)
+
+# Rust unit tests for UDP.
+test-unit-rust-udp: all-tests-rust
+	timeout $(TIMEOUT) $(CARGO) test --test udp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture $(TEST_UNIT)
+
+# Rust unit tests for TCP.
+test-unit-rust-tcp: all-tests-rust
+	timeout $(TIMEOUT) $(CARGO) test --test tcp $(CARGO_FLAGS) $(CARGO_FEATURES) -- --nocapture $(TEST_UNIT)
 
 # Runs Rust integration tests.
 test-integration-rust:
@@ -230,3 +254,11 @@ test-integration-rust:
 # Cleans dangling test resources.
 test-clean:
 	rm -f /dev/shm/demikernel-*
+
+#=======================================================================================================================
+# Benchmarks
+#=======================================================================================================================
+
+# C unit benchmarks.
+run-benchmarks-c: all-benchmarks-c $(BINDIR)/syscalls.elf
+	timeout $(TIMEOUT) $(BINDIR)/benchmarks.elf
