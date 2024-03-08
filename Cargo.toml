@@ -48,7 +48,10 @@ x86 = "0.52.0"
 nettest = { path = "nettest" }
 dpdk-rs = { path = "dpdk-rs", optional = true }
 
+
 # Virtio dependencies
+lazy_static = "1.4.0"
+[target.'cfg(linux)'.dependencies]
 argh = "0.1.9"
 env_logger = "0.10.0"
 epoll = "4.3.1"

@@ -27,10 +27,13 @@ extern crate log;
 extern crate cfg_if;
 
 #[macro_use]
+#[cfg(target_os = "linux")]
 extern crate nix;
 
+#[cfg(target_os = "linux")]
 extern crate libc;
 
+#[cfg(target_os = "linux")]
 extern crate lazy_static;
 
 #[cfg(feature = "catnip-libos")]
