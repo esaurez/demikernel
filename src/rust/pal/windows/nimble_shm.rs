@@ -9,13 +9,10 @@
 
 use crate::runtime::fail::Fail;
 use ::core::{
-    mem,
     ops::{
         Deref,
         DerefMut,
     },
-    ptr,
-    slice,
 };
 use ::std::ffi;
 
@@ -29,7 +26,8 @@ pub struct SharedMemory {
     was_created: bool,
     /// Name.
     name: ffi::CString,
-
+    // Size
+    size: usize,
     // data - address
     data: Vec<u8>,
 }
@@ -47,9 +45,10 @@ impl SharedMemory {
     pub fn open(name: &str, len: usize) -> Result<SharedMemory, Fail> {
         let name: ffi::CString = Self::build_name(name)?;
 
-        let mut shm: SharedMemory = SharedMemory {
+        let shm: SharedMemory = SharedMemory {
             was_created: false,
             name,
+            size: len,
             data: vec![0; len],
         };
 
@@ -63,6 +62,7 @@ impl SharedMemory {
         let mut shm: SharedMemory = SharedMemory {
             was_created: true,
             name,
+            size,
             data: vec![0; size],
         };
 
@@ -139,14 +139,14 @@ impl Deref for SharedMemory {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.data
+        self.data.as_slice()
     }
 }
 
 /// Mutable dereference trait implementation.
 impl DerefMut for SharedMemory {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.data
+        self.data.as_mut_slice()
     }
 }
 
