@@ -6,10 +6,12 @@
 //======================================================================================================================
 // Imports
 //======================================================================================================================
-#[cfg(all(feature = "catmem-libos", not(feature = "virtio-shmem")))]
+#[cfg(all(feature = "catmem-libos", not(feature = "virtio-shmem", target_os = "linux")))]
 use crate::pal::linux::shm::SharedMemory;
-#[cfg(all(feature = "catmem-libos", feature = "virtio-shmem"))]
+#[cfg(all(feature = "catmem-libos", feature = "virtio-shmem", target_os = "linux"))]
 use crate::pal::linux::virtio_shmem::SharedMemory;
+#[cfg(all(feature = "catmem-libos", target_os = "windows"))]
+use crate::pal::windows::nimble_shmem::SharedMemory;
 use crate::{
     collections::ring::Ring,
     runtime::fail::Fail,
