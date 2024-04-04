@@ -44,6 +44,7 @@ use ::std::{
 /// A LibOS that exposes bi-directional memory queues.
 pub struct CatmemLibOS {
     runtime: SharedDemiRuntime,
+    config: Config,
 }
 
 #[derive(Clone)]
@@ -55,24 +56,26 @@ pub struct SharedCatmemLibOS(SharedObject<CatmemLibOS>);
 
 /// Associated functions for Catmem LibOS.
 impl CatmemLibOS {
-    pub fn new(runtime: SharedDemiRuntime) -> Self {
-        Self { runtime }
+    pub fn new(runtime: SharedDemiRuntime, config: Config) -> Self {
+        Self { runtime, config }
     }
 }
 
 /// Associate Functions for the shared Catmem LibOS
 impl SharedCatmemLibOS {
     /// Instantiates a shared Catmem LibOS.
-    pub fn new(_config: &Config, runtime: SharedDemiRuntime) -> Self {
-        Self(SharedObject::new(CatmemLibOS::new(runtime)))
+    pub fn new(config: &Config, runtime: SharedDemiRuntime) -> Self {
+        Self(SharedObject::new(CatmemLibOS::new(runtime, config.clone())))
     }
 
     /// Creates a new memory queue.
     pub fn create_pipe(&mut self, name: &str) -> Result<QDesc, Fail> {
         trace!("create_pipe() name={:?}", name);
+        let name_with_prefix = format!("{}{}", self.get_name_prefix(), name);
+
         let qd: QDesc = self
             .runtime
-            .alloc_queue::<SharedCatmemQueue>(SharedCatmemQueue::create(name)?);
+            .alloc_queue::<SharedCatmemQueue>(SharedCatmemQueue::create(&name_with_prefix)?);
 
         Ok(qd)
     }
@@ -80,10 +83,11 @@ impl SharedCatmemLibOS {
     /// Opens a memory queue.
     pub fn open_pipe(&mut self, name: &str) -> Result<QDesc, Fail> {
         trace!("open_pipe() name={:?}", name);
+        let name_with_prefix = format!("{}{}", self.get_name_prefix(), name);
 
         let qd: QDesc = self
             .runtime
-            .alloc_queue::<SharedCatmemQueue>(SharedCatmemQueue::open(name)?);
+            .alloc_queue::<SharedCatmemQueue>(SharedCatmemQueue::open(&name_with_prefix)?);
 
         Ok(qd)
     }
@@ -206,6 +210,10 @@ impl SharedCatmemLibOS {
 
     pub fn get_queue(&self, qd: &QDesc) -> Result<SharedCatmemQueue, Fail> {
         Ok(self.runtime.get_qtable().get::<SharedCatmemQueue>(qd)?.clone())
+    }
+
+    fn get_name_prefix(&self) -> String {
+        self.config.catmem_name_prefix()
     }
 }
 

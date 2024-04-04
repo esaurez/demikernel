@@ -77,11 +77,6 @@ pub enum LibOS {
 impl LibOS {
     /// Instantiates a new LibOS.
     pub fn new(libos_name: LibOSName) -> Result<Self, Fail> {
-        #[cfg(feature = "profiler")]
-        timer!("demikernel::new");
-
-        logging::initialize();
-
         // Read in configuration file.
         let config_path: String = match env::var("CONFIG_PATH") {
             Ok(config_path) => config_path,
@@ -93,6 +88,15 @@ impl LibOS {
             },
         };
         let config: Config = Config::new(config_path);
+        Self::new_with_config(libos_name, config)
+    }
+
+    pub fn new_with_config(libos_name: LibOSName, config: Config) -> Result<Self, Fail> {
+        #[cfg(feature = "profiler")]
+        timer!("demikernel::new");
+
+        logging::initialize();
+
         let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
         // Instantiate LibOS.
         #[allow(unreachable_patterns)]

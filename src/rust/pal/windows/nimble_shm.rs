@@ -7,29 +7,40 @@
 // Imports
 //======================================================================================================================
 
-use crate::runtime::fail::Fail;
-use ::core::{
-    ops::{
-        Deref,
-        DerefMut,
+use crate::{
+    pal::windows::virtio_shmem_lib::base::{
+        RegionLocation,
+        RegionManager,
+        RegionTrait,
+    },
+    runtime::fail::Fail,
+};
+use ::core::ops::{
+    Deref,
+    DerefMut,
+};
+use lazy_static::lazy_static;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        Mutex,
     },
 };
-use ::std::ffi;
 
 //======================================================================================================================
 // Structures
 //======================================================================================================================
 
+type RegionBox = Box<dyn RegionTrait<Target = [u8]>>;
+
+lazy_static! {
+    static ref MEM_MANAGERS: Arc<Mutex<HashMap<String, Box<dyn RegionManager>>>> = Arc::new(Mutex::new(HashMap::new()));
+}
+
 /// A named shared memory region.
 pub struct SharedMemory {
-    /// Was this region created or opened?
-    was_created: bool,
-    /// Name.
-    name: ffi::CString,
-    // Size
-    size: usize,
-    // data - address
-    data: Vec<u8>,
+    region: RegionBox,
 }
 
 //======================================================================================================================
@@ -38,95 +49,88 @@ pub struct SharedMemory {
 
 /// Associated functions.
 impl SharedMemory {
-    /// Prefix for shared memory region names.
     const SHM_NAME_PREFIX: &'static str = "demikernel-";
 
-    /// Opens an existing named shared memory region.
-    pub fn open(name: &str, len: usize) -> Result<SharedMemory, Fail> {
-        let name: ffi::CString = Self::build_name(name)?;
+    pub fn add_manager(id: &str, manager: Box<dyn RegionManager>) {
+        let mut mem_manager = MEM_MANAGERS.lock().unwrap();
+        mem_manager.insert(id.to_string(), manager);
+    }
 
-        let shm: SharedMemory = SharedMemory {
-            was_created: false,
-            name,
-            size: len,
-            data: vec![0; len],
+    /// Opens an existing named shared memory region.
+    pub fn open(name: &str, _len: usize) -> Result<SharedMemory, Fail> {
+        let mut mem_lock = MEM_MANAGERS.lock().map_err(|e| Fail {
+            errno: 0,
+            cause: e.to_string(),
+        })?;
+        let (id, segment_name) = Self::parse_name(name)?;
+
+        let region_man: &mut Box<dyn RegionManager> = match mem_lock.get_mut(&id) {
+            Some(region) => region,
+            None => {
+                return Err(Fail::new(
+                    libc::EINVAL,
+                    &format!("failed to get region manager: {:?}", id),
+                ))
+            },
         };
 
-        Ok(shm)
+        let region_location: RegionLocation = match region_man.get_region(&segment_name) {
+            Ok(region_location) => region_location,
+            Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to get region: {:?}", e))),
+        };
+        let region: RegionBox = match region_man.mmap_region(&region_location) {
+            Ok(region) => region,
+            Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to mmap region: {:?}", e))),
+        };
+        Ok(Self { region })
     }
 
     /// Creates a named shared memory region.
     pub fn create(name: &str, size: usize) -> Result<SharedMemory, Fail> {
-        let name: ffi::CString = Self::build_name(name)?;
+        let mut mem_lock = MEM_MANAGERS.lock().map_err(|e| Fail {
+            errno: 0,
+            cause: e.to_string(),
+        })?;
+        let (id, segment_name) = Self::parse_name(name)?;
 
-        let mut shm: SharedMemory = SharedMemory {
-            was_created: true,
-            name,
-            size,
-            data: vec![0; size],
+        let region_man = match mem_lock.get_mut(&id) {
+            Some(region) => region,
+            None => {
+                return Err(Fail::new(
+                    libc::EINVAL,
+                    &format!("failed to get region manager: {:?}", id),
+                ))
+            },
         };
 
-        shm.truncate(size)?;
-        shm.map(size)?;
-
-        Ok(shm)
+        let region_location: RegionLocation = match region_man.create_region(&segment_name, size as u64) {
+            Ok(region_location) => region_location,
+            Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to get region: {:?}", e))),
+        };
+        let region: RegionBox = match region_man.mmap_region(&region_location) {
+            Ok(region) => region,
+            Err(e) => return Err(Fail::new(libc::EINVAL, &format!("failed to mmap region: {:?}", e))),
+        };
+        Ok(Self { region })
     }
 
-    /// Closes the target shared memory region.
-    fn close(&mut self) -> Result<(), Fail> {
-        Ok(())
-    }
-
-    /// Unlinks the target shared memory region.
-    fn unlink(&mut self) -> Result<(), Fail> {
-        Ok(())
-    }
-
-    /// Truncates the target shared memory region.
-    fn truncate(&mut self, size: usize) -> Result<(), Fail> {
-        self.size = size;
-
-        Ok(())
-    }
-
-    /// Maps the target shared memory region to the address space of the calling process.
-    fn map(&mut self, size: usize) -> Result<(), Fail> {
-        self.size = size;
-        Ok(())
-    }
-
-    // Unmaps the target shared memory region from the address space of the calling process.
-    fn unmap(&mut self) -> Result<(), Fail> {
-        Ok(())
-    }
-
-    /// Constructs the name of shared memory region.
-    fn build_name(name: &str) -> Result<ffi::CString, Fail> {
-        // Check if provided name is valid.
-        if name.is_empty() {
+    fn parse_name(name: &str) -> Result<(String, String), Fail> {
+        // The name send by the user would be in the format <id>-<ip:port>:<rx|tx>. The id may have '-' in it.
+        // So we need to split the name into two parts. The first part is the id and the second part is the ip:port:<rx|tx>.
+        // The first part could have multiple - in it, so we find the last - in the name and split the name into two parts.
+        let mut parts = name.rsplitn(2, '-');
+        // The first part is the id.
+        let ip_port_rx_tx = parts.next().unwrap_or("");
+        if ip_port_rx_tx.is_empty() {
+            return Err(Fail::new(libc::EINVAL, "name of shared memory region cannot be empty"));
+        }
+        // The second part is the ip:port:<rx|tx>.
+        let id = parts.next().unwrap_or("");
+        if id.is_empty() {
             return Err(Fail::new(libc::EINVAL, "name of shared memory region cannot be empty"));
         }
         let prefix: String = String::from(Self::SHM_NAME_PREFIX);
-        match ffi::CString::new((prefix + name).to_string()) {
-            Ok(name) => Ok(name),
-            Err(_) => Err(Fail::new(libc::EINVAL, "could not parse name of shared memory region")),
-        }
-    }
-
-    /// Returns the size of the target shared memory region.
-    #[allow(unused)]
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    /// Writes a value to the target shared memory region at a given offset.
-    #[allow(unused)]
-    pub fn write<T>(&mut self, index: usize, val: &T) {
-    }
-
-    /// Reads a value from the target shared memory region at a given offset.
-    #[allow(unused)]
-    pub fn read<T>(&mut self, index: usize, val: &mut T) {
+        Ok((id.to_owned(), format!("{}{}", prefix, ip_port_rx_tx)))
     }
 }
 
@@ -139,36 +143,13 @@ impl Deref for SharedMemory {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.data.as_slice()
+        &self.region
     }
 }
 
 /// Mutable dereference trait implementation.
 impl DerefMut for SharedMemory {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.data.as_mut_slice()
-    }
-}
-
-/// Drop trait implementation.
-impl Drop for SharedMemory {
-    fn drop(&mut self) {
-        // 1) Unmap the underlying shared memory region from the address space of the calling process.
-        match self.unmap() {
-            Ok(_) => {},
-            Err(e) => eprintln!("{}", e),
-        };
-        // 2) Close the underlying shared memory region.
-        match self.close() {
-            Ok(_) => {},
-            Err(e) => eprintln!("{}", e),
-        }
-        // 3) Remove the underlying shared memory region name link.
-        if self.was_created {
-            match self.unlink() {
-                Ok(_) => {},
-                Err(e) => eprintln!("{}", e),
-            }
-        }
+        &mut self.region
     }
 }

@@ -195,4 +195,10 @@ impl Config {
     pub fn use_jumbo_frames(&self) -> bool {
         ::std::env::var("USE_JUMBO").is_ok()
     }
+
+    #[cfg(feature = "catmem-libos")]
+    /// Reads the "Catmem name prefix" parameter from the underlying configuration file.
+    pub fn catmem_name_prefix(&self) -> String {
+        self.0["catmem"]["name_prefix"].as_str().unwrap_or("").to_owned()
+    }
 }
