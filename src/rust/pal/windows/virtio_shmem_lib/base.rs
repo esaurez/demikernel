@@ -3,7 +3,7 @@ use ::core::ops::{
     DerefMut,
 };
 
-use crate::runtime::fail::Fail;
+pub use crate::runtime::fail::Fail;
 
 pub type NimbleResult<T> = std::result::Result<T, Fail>;
 
