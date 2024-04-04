@@ -35,7 +35,7 @@ use std::{
 type RegionBox = Box<dyn RegionTrait<Target = [u8]>>;
 
 lazy_static! {
-    static ref MEM_MANAGERS: Arc<Mutex<HashMap<String, Box<dyn RegionManager>>>> = Arc::new(Mutex::new(HashMap::new()));
+    static ref MEM_MANAGERS: Arc<Mutex<HashMap<String, Arc<Mutex<Box<dyn RegionManager>>>>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
 /// A named shared memory region.
@@ -51,7 +51,7 @@ pub struct SharedMemory {
 impl SharedMemory {
     const SHM_NAME_PREFIX: &'static str = "demikernel-";
 
-    pub fn add_manager(id: &str, manager: Box<dyn RegionManager>) {
+    pub fn add_manager(id: &str, manager: Arc<Mutex<Box<dyn RegionManager>>>) {
         let mut mem_manager = MEM_MANAGERS.lock().unwrap();
         mem_manager.insert(id.to_string(), manager);
     }
@@ -64,7 +64,7 @@ impl SharedMemory {
         })?;
         let (id, segment_name) = Self::parse_name(name)?;
 
-        let region_man: &mut Box<dyn RegionManager> = match mem_lock.get_mut(&id) {
+        let region_man_lock = match mem_lock.get_mut(&id) {
             Some(region) => region,
             None => {
                 return Err(Fail::new(
@@ -73,6 +73,11 @@ impl SharedMemory {
                 ))
             },
         };
+
+        let mut region_man = region_man_lock.lock().map_err(|e|Fail {
+            errno: 0,
+            cause: e.to_string(),
+        })?;
 
         let region_location: RegionLocation = match region_man.get_region(&segment_name) {
             Ok(region_location) => region_location,
@@ -93,7 +98,7 @@ impl SharedMemory {
         })?;
         let (id, segment_name) = Self::parse_name(name)?;
 
-        let region_man = match mem_lock.get_mut(&id) {
+        let region_man_lock = match mem_lock.get_mut(&id) {
             Some(region) => region,
             None => {
                 return Err(Fail::new(
@@ -102,6 +107,11 @@ impl SharedMemory {
                 ))
             },
         };
+
+        let mut region_man = region_man_lock.lock().map_err(|e|Fail {
+            errno: 0,
+            cause: e.to_string(),
+        })?;
 
         let region_location: RegionLocation = match region_man.create_region(&segment_name, size as u64) {
             Ok(region_location) => region_location,
