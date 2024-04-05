@@ -83,7 +83,7 @@ impl SharedCatmemLibOS {
     /// Creates a new memory queue.
     pub fn create_pipe(&mut self, name: &str) -> Result<QDesc, Fail> {
         trace!("create_pipe() name={:?}", name);
-        let name_with_prefix = format!("{}{}", self.get_name_prefix(), name);
+        let name_with_prefix = format!("{}-{}", self.get_name_prefix(), name);
 
         let qd: QDesc = self
             .runtime
