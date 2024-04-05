@@ -35,7 +35,8 @@ use std::{
 type RegionBox = Box<dyn RegionTrait<Target = [u8]>>;
 
 lazy_static! {
-    static ref MEM_MANAGERS: Arc<Mutex<HashMap<String, Arc<Mutex<Box<dyn RegionManager>>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    static ref MEM_MANAGERS: Arc<Mutex<HashMap<String, Arc<Mutex<Box<dyn RegionManager>>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 }
 
 /// A named shared memory region.
@@ -64,7 +65,7 @@ impl SharedMemory {
         })?;
         let (id, segment_name) = Self::parse_name(name)?;
 
-        let region_man_arc= match mem_lock.get_mut(&id) {
+        let region_man_arc = match mem_lock.get_mut(&id) {
             Some(region) => region,
             None => {
                 return Err(Fail::new(
@@ -74,7 +75,7 @@ impl SharedMemory {
             },
         };
 
-        let mut region_man = region_man_arc.lock().map_err(|e|Fail {
+        let mut region_man = region_man_arc.lock().map_err(|e| Fail {
             errno: 0,
             cause: e.to_string(),
         })?;
@@ -108,7 +109,7 @@ impl SharedMemory {
             },
         };
 
-        let mut region_man = region_man_arc.lock().map_err(|e|Fail {
+        let mut region_man = region_man_arc.lock().map_err(|e| Fail {
             errno: 0,
             cause: e.to_string(),
         })?;

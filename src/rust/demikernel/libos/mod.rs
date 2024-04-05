@@ -114,7 +114,6 @@ impl LibOS {
 
         timer!("demikernel::new");
 
-
         #[allow(unused_mut)]
         let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
         // Instantiate LibOS.
