@@ -7,6 +7,8 @@
 
 use crate::{
     collections::async_queue::SharedAsyncQueue,
+    expect_ok,
+    expect_some,
     inetstack::protocols::{
         arp::SharedArpPeer,
         ethernet2::{
@@ -40,19 +42,13 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
-        scheduler::Yielder,
         QDesc,
         SharedDemiRuntime,
         SharedObject,
     },
 };
-use ::futures::{
-    channel::mpsc,
-    future::FutureExt,
-    select_biased,
-};
+use ::futures::channel::mpsc;
 use ::std::{
-    convert::TryInto,
     net::SocketAddrV4,
     ops::{
         Deref,
@@ -192,17 +188,23 @@ impl<N: NetworkRuntime> SharedActiveOpenSocket<N> {
         // TODO(RFC1323): Clamp the scale to 14 instead of panicking.
         assert!(local_window_scale <= 14 && remote_window_scale <= 14);
 
-        let rx_window_size: u32 = (self.tcp_config.get_receive_window_size())
-            .checked_shl(local_window_scale as u32)
-            .expect("TODO: Window size overflow")
-            .try_into()
-            .expect("TODO: Window size overflow");
+        let rx_window_size: u32 = expect_ok!(
+            expect_some!(
+                (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale as u32),
+                "TODO: Window size overflow"
+            )
+            .try_into(),
+            "TODO: Window size overflow"
+        );
 
-        let tx_window_size: u32 = (header.window_size)
-            .checked_shl(remote_window_scale as u32)
-            .expect("TODO: Window size overflow")
-            .try_into()
-            .expect("TODO: Window size overflow");
+        let tx_window_size: u32 = expect_ok!(
+            expect_some!(
+                (header.window_size as u32).checked_shl(remote_window_scale as u32),
+                "TODO: Window size overflow"
+            )
+            .try_into(),
+            "TODO: Window size overflow"
+        );
 
         info!("Window sizes: local {}, remote {}", rx_window_size, tx_window_size);
         info!(
@@ -233,14 +235,14 @@ impl<N: NetworkRuntime> SharedActiveOpenSocket<N> {
         )?)
     }
 
-    pub async fn connect(mut self, yielder: Yielder) -> Result<EstablishedSocket<N>, Fail> {
+    pub async fn connect(mut self) -> Result<EstablishedSocket<N>, Fail> {
         // Start connection handshake.
         let handshake_retries: usize = self.tcp_config.get_handshake_retries();
         let handshake_timeout = self.tcp_config.get_handshake_timeout();
         for _ in 0..handshake_retries {
             // Look up remote MAC address.
             // TODO: Do we need to do this every iteration?
-            let remote_link_addr = match self.clone().arp.query(self.remote.ip().clone(), &yielder).await {
+            let remote_link_addr = match self.clone().arp.query(self.remote.ip().clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("ARP query failed: {:?}", e);
@@ -273,27 +275,17 @@ impl<N: NetworkRuntime> SharedActiveOpenSocket<N> {
             self.transport.transmit(Box::new(segment));
 
             // Wait for either a response or timeout.
-            let yielder2: Yielder = Yielder::new();
-            let timeout_future = self.runtime.get_timer().wait(handshake_timeout, &yielder2).fuse();
-            let mut me: Self = self.clone();
-            let ack_future = me.recv_queue.pop(&yielder).fuse();
-            futures::pin_mut!(timeout_future);
-            futures::pin_mut!(ack_future);
-            select_biased! {
-                // If we received a response, process the response and either finish setting up the connection or try
-                // again.
-                result = ack_future => match result {
-                    Ok((_, header, _)) => match self.process_ack(header) {
-                        Ok(socket) => return Ok(socket),
-                        Err(Fail{errno, cause:_}) if errno == libc::EAGAIN => continue,
-                        Err(e) => return Err(e),
-                    },
+            match self.recv_queue.pop(Some(handshake_timeout)).await {
+                Ok((_, header, _)) => match self.process_ack(header) {
+                    Ok(socket) => return Ok(socket),
+                    Err(Fail { errno, cause: _ }) if errno == libc::EAGAIN => continue,
                     Err(e) => return Err(e),
                 },
-                // If timeout, then we try again unless this coroutine has been canceled.
-                result = timeout_future => match result {
-                    Ok(()) => continue,
-                    Err(e) => return Err(e),
+                Err(Fail { errno, cause: _ }) if errno == libc::ETIMEDOUT => continue,
+                Err(_) => {
+                    unreachable!(
+                        "either the ack deadline changed or the deadline passed, no other errors are possible!"
+                    )
                 },
             }
         }

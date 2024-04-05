@@ -38,20 +38,26 @@ use crate::{
             AcceptState,
             PopState,
             Socket,
+            SocketOpState,
         },
         winsock::WinsockRuntime,
     },
     demikernel::config::Config,
+    expect_ok,
     runtime::{
         fail::Fail,
-        memory::DemiBuffer,
+        memory::{
+            DemiBuffer,
+            MemoryRuntime,
+        },
         network::transport::NetworkTransport,
-        scheduler::Yielder,
+        poll_yield,
         DemiRuntime,
         SharedDemiRuntime,
         SharedObject,
     },
 };
+use ::futures::FutureExt;
 
 //======================================================================================================================
 // Structures
@@ -64,6 +70,9 @@ pub(super) struct WinConfig {
 
     /// Linger socket options.
     linger_time: Option<Duration>,
+
+    /// Whether Nagle's algorithm is enabled or disabled.
+    nagle: Option<bool>,
 }
 
 /// Underlying network transport.
@@ -72,7 +81,7 @@ pub struct CatnapTransport {
     winsock: WinsockRuntime,
 
     /// I/O completion port for overlapped I/O.
-    iocp: IoCompletionPort,
+    iocp: IoCompletionPort<SocketOpState>,
 
     /// Configuration values.
     config: WinConfig,
@@ -93,42 +102,40 @@ impl SharedCatnapTransport {
     /// Create a new transport instance.
     pub fn new(config: &Config, runtime: &mut SharedDemiRuntime) -> Self {
         let config: WinConfig = WinConfig {
-            keepalive_params: config.tcp_keepalive().expect("failed to load TCP settings"),
-            linger_time: config.linger_time().expect("failed to load linger settings"),
+            keepalive_params: expect_ok!(config.tcp_keepalive(), "failed to load TCP settings"),
+            linger_time: expect_ok!(config.linger_time(), "failed to load linger settings"),
+            nagle: expect_ok!(config.nagle(), "failed to load nagle's algorithm settings"),
         };
 
         let me: Self = Self(SharedObject::new(CatnapTransport {
-            winsock: WinsockRuntime::new().expect("failed to initialize WinSock"),
-            iocp: IoCompletionPort::new().expect("failed to setup I/O completion port"),
+            winsock: expect_ok!(WinsockRuntime::new(), "failed to initialize WinSock"),
+            iocp: expect_ok!(IoCompletionPort::new(), "failed to setup I/O completion port"),
             config,
             runtime: runtime.clone(),
         }));
 
-        runtime
-            .insert_background_coroutine(
+        expect_ok!(
+            runtime.insert_background_coroutine(
                 "catnap::transport::epoll",
                 Box::pin({
                     let mut me: Self = me.clone();
-                    async move { me.run_event_processor().await }
+                    async move { me.run_event_processor().await }.fuse()
                 }),
-            )
-            .expect("should be able to insert background coroutine");
+            ),
+            "should be able to insert background coroutine"
+        );
 
         me
     }
 
     /// Run a coroutine which pulls the I/O completion port for events.
     async fn run_event_processor(&mut self) {
-        let yielder: Yielder = Yielder::new();
         loop {
             if let Err(err) = self.0.iocp.process_events() {
                 error!("Completion port error: {}", err);
             }
 
-            match yielder.yield_once().await {
-                Ok(()) => continue,
-                Err(_) => break,
-            }
+            poll_yield().await;
         }
     }
 }
@@ -168,13 +175,12 @@ impl NetworkTransport for SharedCatnapTransport {
     }
 
     /// Asynchronously disconnect and shut down a socket.
-    async fn close(&mut self, socket: &mut Self::SocketDescriptor, yielder: Yielder) -> Result<(), Fail> {
+    async fn close(&mut self, socket: &mut Self::SocketDescriptor) -> Result<(), Fail> {
         match unsafe {
             self.0.iocp.do_io(
-                &yielder,
-                |overlapped: *mut OVERLAPPED| socket.start_disconnect(overlapped),
-                |_| Err(Fail::new(libc::EFAULT, "cannot cancel a disconnect")),
-                |result: OverlappedResult| socket.finish_disconnect(result),
+                SocketOpState::Close,
+                |_: Pin<&mut SocketOpState>, overlapped: *mut OVERLAPPED| socket.start_disconnect(overlapped),
+                |_: Pin<&mut SocketOpState>, result: OverlappedResult| socket.finish_disconnect(result),
             )
         }
         .await
@@ -197,19 +203,12 @@ impl NetworkTransport for SharedCatnapTransport {
 
     /// Accept a connection on the specified socket. The coroutine will not finish until a connection is successfully
     /// accepted or `yielder` is cancelled.
-    async fn accept(
-        &mut self,
-        socket: &mut Self::SocketDescriptor,
-        yielder: Yielder,
-    ) -> Result<(Socket, SocketAddr), Fail> {
-        let start = |accept_result: Pin<&mut AcceptState>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
+    async fn accept(&mut self, socket: &mut Self::SocketDescriptor) -> Result<(Socket, SocketAddr), Fail> {
+        let start = |accept_result: Pin<&mut SocketOpState>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
             socket.start_accept(accept_result, overlapped)
         };
-        let cancel = |_: Pin<&mut AcceptState>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
-            socket.cancel_io(overlapped)
-        };
         let me_finish: Self = self.clone();
-        let finish = |accept_result: Pin<&mut AcceptState>,
+        let finish = |accept_result: Pin<&mut SocketOpState>,
                       result: OverlappedResult|
          -> Result<(Socket, SocketAddr, SocketAddr), Fail> {
             socket.finish_accept(accept_result, &me_finish.0.iocp, result)
@@ -218,7 +217,7 @@ impl NetworkTransport for SharedCatnapTransport {
         let (socket, _local_addr, remote_addr) = unsafe {
             self.0
                 .iocp
-                .do_io_with(AcceptState::new(), &yielder, start, cancel, finish)
+                .do_io(SocketOpState::Accept(AcceptState::new()), start, finish)
         }
         .await?;
 
@@ -226,18 +225,16 @@ impl NetworkTransport for SharedCatnapTransport {
     }
 
     /// Connect a socket to a remote address.
-    async fn connect(
-        &mut self,
-        socket: &mut Self::SocketDescriptor,
-        remote: SocketAddr,
-        yielder: Yielder,
-    ) -> Result<(), Fail> {
+    async fn connect(&mut self, socket: &mut Self::SocketDescriptor, remote: SocketAddr) -> Result<(), Fail> {
         unsafe {
             self.0.iocp.do_io(
-                &yielder,
-                |overlapped: *mut OVERLAPPED| -> Result<(), Fail> { socket.start_connect(remote, overlapped) },
-                |overlapped: *mut OVERLAPPED| -> Result<(), Fail> { socket.cancel_io(overlapped) },
-                |result: OverlappedResult| -> Result<(), Fail> { socket.finish_connect(result) },
+                SocketOpState::Connect,
+                |_: Pin<&mut SocketOpState>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
+                    socket.start_connect(remote, overlapped)
+                },
+                |_: Pin<&mut SocketOpState>, result: OverlappedResult| -> Result<(), Fail> {
+                    socket.finish_connect(result)
+                },
             )
         }
         .await
@@ -247,23 +244,18 @@ impl NetworkTransport for SharedCatnapTransport {
     async fn pop(
         &mut self,
         socket: &mut Self::SocketDescriptor,
-        buf: &mut DemiBuffer,
         size: usize,
-        yielder: Yielder,
-    ) -> Result<Option<SocketAddr>, Fail> {
+    ) -> Result<(Option<SocketAddr>, DemiBuffer), Fail> {
+        let mut buf: DemiBuffer = DemiBuffer::new(size as u16);
         unsafe {
-            self.0.iocp.do_io_with(
-                PopState::new(buf.clone()),
-                &yielder,
-                |pop_state: Pin<&mut PopState>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
-                    socket.start_pop(pop_state, overlapped)
+            self.0.iocp.do_io(
+                SocketOpState::Pop(PopState::new(buf.clone())),
+                |state: Pin<&mut SocketOpState>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
+                    socket.start_pop(state, overlapped)
                 },
-                |_pop_state: Pin<&mut PopState>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
-                    socket.cancel_io(overlapped)
-                },
-                |pop_state: Pin<&mut PopState>,
+                |state: Pin<&mut SocketOpState>,
                  result: OverlappedResult|
-                 -> Result<(usize, Option<SocketAddr>), Fail> { socket.finish_pop(pop_state, result) },
+                 -> Result<(usize, Option<SocketAddr>), Fail> { socket.finish_pop(state, result) },
             )
         }
         .await
@@ -274,7 +266,7 @@ impl NetworkTransport for SharedCatnapTransport {
             } else {
                 trace!("not data received");
             }
-            Ok(sockaddr)
+            Ok((sockaddr, buf))
         })
     }
 
@@ -286,21 +278,16 @@ impl NetworkTransport for SharedCatnapTransport {
         socket: &mut Self::SocketDescriptor,
         buf: &mut DemiBuffer,
         addr: Option<SocketAddr>,
-        yielder: Yielder,
     ) -> Result<(), Fail> {
         loop {
             let result: Result<usize, Fail> = unsafe {
-                self.0.iocp.do_io_with(
-                    buf.clone(),
-                    &yielder,
-                    |buffer: Pin<&mut DemiBuffer>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
-                        socket.start_push(buffer, addr, overlapped)
+                self.0.iocp.do_io(
+                    SocketOpState::Push(buf.clone()),
+                    |state: Pin<&mut SocketOpState>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
+                        socket.start_push(state, addr, overlapped)
                     },
-                    |_buffer: Pin<&mut DemiBuffer>, overlapped: *mut OVERLAPPED| -> Result<(), Fail> {
-                        socket.cancel_io(overlapped)
-                    },
-                    |buffer: Pin<&mut DemiBuffer>, result: OverlappedResult| -> Result<usize, Fail> {
-                        socket.finish_push(buffer, result)
+                    |_: Pin<&mut SocketOpState>, result: OverlappedResult| -> Result<usize, Fail> {
+                        socket.finish_push(result)
                     },
                 )
             }
@@ -329,3 +316,5 @@ impl NetworkTransport for SharedCatnapTransport {
         &self.0.runtime
     }
 }
+
+impl MemoryRuntime for SharedCatnapTransport {}

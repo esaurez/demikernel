@@ -7,7 +7,7 @@
 
 [package]
 name = "demikernel"
-version = "1.4.7"
+version = "1.5.0"
 authors = ["Microsoft Corporation"]
 edition = "2021"
 description = "Kernel-Bypass LibOS Architecture"
@@ -24,21 +24,23 @@ license-file = "LICENSE.txt"
 
 # Third Party
 arrayvec = "0.7.4"
-async-trait = "0.1.75"
-anyhow = "1.0.76"
+async-trait = "0.1.79"
+anyhow = "1.0.81"
 bit-iter = "1.2.0"
 cfg-if = "1.0.0"
 crc = "3.0.1"
-clap = "4.4.11"
-crossbeam-channel = "0.5.9"
+clap = "4.5.4"
+crossbeam-channel = "0.5.12"
 eui48 = "1.1.0"
-flexi_logger = "0.27.3"
-futures = "0.3.29"
-libc = "0.2.151"
-log = "0.4.20"
+flexi_logger = "0.28.0"
+futures = "0.3.30"
+histogram = "0.9.1"
+libc = "0.2.153"
+log = "0.4.21"
+mimalloc = { version = "0.1.39", default-features = false }
 rand = { version = "0.8.5", features = ["small_rng"] }
 slab = "0.4.9"
-socket2 = "0.5.5"
+socket2 = "0.5.6"
 yaml-rust = "0.4.5"
 x86 = "0.52.0"
 
@@ -46,14 +48,11 @@ x86 = "0.52.0"
 nettest = { path = "nettest" }
 dpdk-rs = { path = "dpdk-rs", optional = true }
 
-# Demikernel Organization
-liburing = { git = "https://github.com/demikernel/liburing-rs", rev = "780827ee3f805d94f9909bd47cd925ee8476a64b", optional = true }
-
 # Windows-specific dependencies.
 [target.'cfg(windows)'.dependencies]
 # libc implementation in Rust is quite different for Windows and Linux. This library provides the relevant networking
 # constants and data structures for Windows.
-windows = { version = "0.52.0", features = [
+windows = { version = "0.54.0", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Security",
@@ -63,7 +62,7 @@ windows = { version = "0.52.0", features = [
     "Win32_System_Threading",
 ] }
 # for interacting with socket2.
-windows-sys = { version = "0.48.0", features = ["Win32_Networking_WinSock"] }
+windows-sys = { version = "0.52.0", features = ["Win32_Networking_WinSock"] }
 
 #=======================================================================================================================
 # Targets
@@ -151,7 +150,6 @@ path = "examples/rust/tcp-ping-pong.rs"
 default = ["catnap-libos"]
 catnap-libos = []
 catpowder-libos = []
-catcollar-libos = ["liburing"]
 catmem-libos = []
 catnip-libos = ["libdpdk"]
 catloop-libos = ["catmem-libos"]

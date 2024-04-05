@@ -11,6 +11,8 @@ mod ring;
 use self::queue::SharedCatmemQueue;
 use crate::{
     demikernel::config::Config,
+    expect_ok,
+    pal::linux::socketaddrv4_to_sockaddr,
     runtime::{
         fail::Fail,
         limits,
@@ -19,9 +21,12 @@ use crate::{
             MemoryRuntime,
         },
         queue::downcast_queue,
-        scheduler::Yielder,
-        types::demi_sgarray_t,
-        Operation,
+        types::{
+            demi_opcode_t,
+            demi_qr_value_t,
+            demi_qresult_t,
+            demi_sgarray_t,
+        },
         OperationResult,
         SharedDemiRuntime,
         SharedObject,
@@ -29,12 +34,14 @@ use crate::{
     QDesc,
     QToken,
 };
+use ::futures::FutureExt;
 use ::std::{
+    mem,
     ops::{
         Deref,
         DerefMut,
     },
-    pin::Pin,
+    time::Duration,
 };
 
 //======================================================================================================================
@@ -108,18 +115,16 @@ impl SharedCatmemLibOS {
         trace!("async_close() qd={:?}", qd);
         let mut queue: SharedCatmemQueue = self.get_queue(&qd)?;
         let coroutine_constructor = || -> Result<QToken, Fail> {
-            let task_name: String = format!("Catmem::async_close for qd={:?}", qd);
-            let coroutine_factory =
-                |yielder| -> Pin<Box<Operation>> { Box::pin(self.clone().close_coroutine(qd, yielder)) };
+            let coroutine = Box::pin(self.clone().close_coroutine(qd).fuse());
             self.runtime
                 .clone()
-                .insert_coroutine_with_tracking(&task_name, coroutine_factory, qd)
+                .insert_io_coroutine("Catmem::async_close", coroutine)
         };
 
         queue.async_close(coroutine_constructor)
     }
 
-    pub async fn close_coroutine(mut self, qd: QDesc, yielder: Yielder) -> (QDesc, OperationResult) {
+    pub async fn close_coroutine(mut self, qd: QDesc) -> (QDesc, OperationResult) {
         // Make sure the queue still exists.
         let mut queue: SharedCatmemQueue = match self.get_queue(&qd) {
             Ok(queue) => queue,
@@ -127,7 +132,7 @@ impl SharedCatmemLibOS {
         };
 
         // Wait for close operation to complete.
-        match queue.do_async_close(yielder).await {
+        match queue.do_async_close().await {
             // Operation completed successfully, thus free resources.
             Ok(()) => {
                 // Release the queue descriptor, even if pushing EoF failed. This will prevent any further
@@ -135,9 +140,7 @@ impl SharedCatmemLibOS {
                 // be eventually released.
                 // Expect is safe here because we looked up the queue to schedule this coroutine and no other close
                 // coroutine should be able to run due to state machine checks.
-                self.runtime
-                    .free_queue::<SharedCatmemQueue>(&qd)
-                    .expect("queue should exist");
+                expect_ok!(self.runtime.free_queue::<SharedCatmemQueue>(&qd), "queue should exist");
                 (qd, OperationResult::Close)
             },
             // Operation failed, thus warn and return an error.
@@ -152,7 +155,7 @@ impl SharedCatmemLibOS {
     pub fn push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<QToken, Fail> {
         trace!("push() qd={:?}", qd);
 
-        let buf: DemiBuffer = self.runtime.clone_sgarray(sga)?;
+        let buf: DemiBuffer = self.clone_sgarray(sga)?;
 
         if buf.len() == 0 {
             let cause: String = format!("zero-length buffer (qd={:?})", qd);
@@ -160,23 +163,19 @@ impl SharedCatmemLibOS {
             return Err(Fail::new(libc::EINVAL, &cause));
         }
 
-        let task_name: String = format!("Catmem::push for qd={:?}", qd);
-        let coroutine_factory =
-            |yielder| -> Pin<Box<Operation>> { Box::pin(self.clone().push_coroutine(qd, buf, yielder)) };
+        let coroutine = Box::pin(self.clone().push_coroutine(qd, buf).fuse());
 
-        self.runtime
-            .clone()
-            .insert_coroutine_with_tracking(&task_name, coroutine_factory, qd)
+        self.runtime.clone().insert_io_coroutine("Catmem::push", coroutine)
     }
 
-    pub async fn push_coroutine(self, qd: QDesc, buf: DemiBuffer, yielder: Yielder) -> (QDesc, OperationResult) {
+    pub async fn push_coroutine(self, qd: QDesc, buf: DemiBuffer) -> (QDesc, OperationResult) {
         // Make sure the queue still exists.
         let mut queue: SharedCatmemQueue = match self.get_queue(&qd) {
             Ok(queue) => queue,
             Err(e) => return (qd, OperationResult::Failed(e)),
         };
         // Handle result.
-        match queue.do_push(buf, yielder).await {
+        match queue.do_push(buf).await {
             Ok(()) => (qd, OperationResult::Push),
             Err(e) => (qd, OperationResult::Failed(e)),
         }
@@ -189,16 +188,12 @@ impl SharedCatmemLibOS {
         // We just assert 'size' here, because it was previously checked at PDPIX layer.
         debug_assert!(size.is_none() || ((size.unwrap() > 0) && (size.unwrap() <= limits::POP_SIZE_MAX)));
 
-        let task_name: String = format!("Catmem::pop for qd={:?}", qd);
-        let coroutine_factory =
-            |yielder| -> Pin<Box<Operation>> { Box::pin(self.clone().pop_coroutine(qd, size, yielder)) };
+        let coroutine = Box::pin(self.clone().pop_coroutine(qd, size).fuse());
 
-        self.runtime
-            .clone()
-            .insert_coroutine_with_tracking(&task_name, coroutine_factory, qd)
+        self.runtime.clone().insert_io_coroutine("Catmem::pop", coroutine)
     }
 
-    pub async fn pop_coroutine(self, qd: QDesc, size: Option<usize>, yielder: Yielder) -> (QDesc, OperationResult) {
+    pub async fn pop_coroutine(self, qd: QDesc, size: Option<usize>) -> (QDesc, OperationResult) {
         // Make sure the queue still exists.
         let mut queue: SharedCatmemQueue = match self.get_queue(&qd) {
             Ok(queue) => queue,
@@ -206,11 +201,78 @@ impl SharedCatmemLibOS {
         };
 
         // Wait for pop to complete.
-        let (buf, _) = match queue.do_pop(size, yielder).await {
+        let (buf, _) = match queue.do_pop(size).await {
             Ok(result) => result,
             Err(e) => return (qd, OperationResult::Failed(e)),
         };
         (qd, OperationResult::Pop(None, buf))
+    }
+
+    /// Waits for any of the given pending I/O operations to complete or a timeout to expire.
+    pub fn wait_any(&mut self, qts: &[QToken], timeout: Duration) -> Result<(usize, demi_qresult_t), Fail> {
+        let (offset, qt, qd, result) = self.runtime.wait_any(qts, timeout)?;
+        Ok((offset, self.create_result(result, qd, qt)))
+    }
+
+    /// Waits for any operation in an I/O queue.
+    pub fn poll(&mut self) {
+        self.runtime.poll()
+    }
+
+    pub fn create_result(&self, result: OperationResult, qd: QDesc, qt: QToken) -> demi_qresult_t {
+        match result {
+            OperationResult::Connect => unreachable!("Memory libOSes do not support connect"),
+            OperationResult::Accept((_, _)) => unreachable!("Memory libOSes do not support connect"),
+            OperationResult::Push => demi_qresult_t {
+                qr_opcode: demi_opcode_t::DEMI_OPC_PUSH,
+                qr_qd: qd.into(),
+                qr_qt: qt.into(),
+                qr_ret: 0,
+                qr_value: unsafe { mem::zeroed() },
+            },
+            OperationResult::Pop(addr, bytes) => match self.into_sgarray(bytes) {
+                Ok(mut sga) => {
+                    if let Some(addr) = addr {
+                        sga.sga_addr = socketaddrv4_to_sockaddr(&addr);
+                    }
+                    let qr_value: demi_qr_value_t = demi_qr_value_t { sga };
+                    demi_qresult_t {
+                        qr_opcode: demi_opcode_t::DEMI_OPC_POP,
+                        qr_qd: qd.into(),
+                        qr_qt: qt.into(),
+                        qr_ret: 0,
+                        qr_value,
+                    }
+                },
+                Err(e) => {
+                    warn!("Operation Failed: {:?}", e);
+                    demi_qresult_t {
+                        qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
+                        qr_qd: qd.into(),
+                        qr_qt: qt.into(),
+                        qr_ret: e.errno as i64,
+                        qr_value: unsafe { mem::zeroed() },
+                    }
+                },
+            },
+            OperationResult::Close => demi_qresult_t {
+                qr_opcode: demi_opcode_t::DEMI_OPC_CLOSE,
+                qr_qd: qd.into(),
+                qr_qt: qt.into(),
+                qr_ret: 0,
+                qr_value: unsafe { mem::zeroed() },
+            },
+            OperationResult::Failed(e) => {
+                warn!("Operation Failed: {:?}", e);
+                demi_qresult_t {
+                    qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
+                    qr_qd: qd.into(),
+                    qr_qt: qt.into(),
+                    qr_ret: e.errno as i64,
+                    qr_value: unsafe { mem::zeroed() },
+                }
+            },
+        }
     }
 
     pub fn get_queue(&self, qd: &QDesc) -> Result<SharedCatmemQueue, Fail> {
@@ -249,3 +311,5 @@ impl Drop for CatmemLibOS {
         }
     }
 }
+
+impl MemoryRuntime for SharedCatmemLibOS {}

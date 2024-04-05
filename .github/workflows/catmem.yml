@@ -2,21 +2,19 @@
 # Licensed under the MIT license.
 
 name: Main Catmem
+
 concurrency:
   group: catmem
   cancel-in-progress: false
 
 on:
+  pull_request:
+    types: [opened, synchronize]
   push:
     branches:
-      - bugfix-*
-      - enhancement-*
-      - feature-*
-      - workaround-*
-      - dev
-      - unstable
       - main
-  workflow_dispatch:
+      - unstable
+      - dev
 
 env:
   LIBOS: catmem
@@ -32,7 +30,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - name: Setup SSH
       shell: bash
       run: |
@@ -48,12 +48,17 @@ jobs:
         echo -e "\tPort ${{ secrets.PORTNUM }}" >> $HOME/.ssh/config
     - name: Run
       run: |
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          branch_name="${{ github.head_ref }}"
+        else
+          branch_name="${{ github.ref_name }}"
+        fi
         pip install --pre azure-data-tables
         python3 tools/demikernel_ci.py \
           --server $SERVER \
           --client $CLIENT \
           --repository demikernel \
-          --branch origin/${{ github.ref_name }} \
+          --branch origin/$branch_name \
           --libos $LIBOS \
           --debug \
           --test-unit --test-system all --delay 2 --enable-nfs \
@@ -61,7 +66,7 @@ jobs:
           --client-addr $CLIENT_ADDR
     - name: Archive Logs
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: debug-pipeline-logs
         path: |
@@ -74,7 +79,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - name: Setup SSH
       shell: bash
       run: |
@@ -90,12 +97,17 @@ jobs:
         echo -e "\tPort ${{ secrets.PORTNUM }}" >> $HOME/.ssh/config
     - name: Run
       run: |
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          branch_name="${{ github.head_ref }}"
+        else
+          branch_name="${{ github.ref_name }}"
+        fi
         pip install --pre azure-data-tables
         python3 tools/demikernel_ci.py \
           --server $SERVER \
           --client $CLIENT \
           --repository demikernel \
-          --branch origin/${{ github.ref_name }} \
+          --branch origin/$branch_name \
           --libos $LIBOS \
           --test-unit --test-system all --delay 2 --enable-nfs \
           --server-addr $SERVER_ADDR \
@@ -104,7 +116,7 @@ jobs:
           --table-name ${{ secrets.AZURE_STORAGE_TABLE_NAME }}
     - name: Archive Logs
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: release-pipeline-logs
         path: |

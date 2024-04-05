@@ -25,7 +25,6 @@ use crate::{
             types::MacAddress,
             NetworkRuntime,
         },
-        scheduler::Yielder,
         QDesc,
         SharedDemiRuntime,
         SharedObject,
@@ -136,24 +135,17 @@ impl<N: NetworkRuntime> SharedTcpPeer<N> {
     }
 
     /// Runs until a new connection is accepted.
-    pub async fn accept(&self, socket: &mut SharedTcpSocket<N>, yielder: Yielder) -> Result<SharedTcpSocket<N>, Fail> {
+    pub async fn accept(&self, socket: &mut SharedTcpSocket<N>) -> Result<SharedTcpSocket<N>, Fail> {
         // Wait for accept to complete.
-        Ok(socket.accept(yielder).await?)
+        Ok(socket.accept().await?)
     }
 
     /// Runs until the connect to remote is made or times out.
-    pub async fn connect(
-        &mut self,
-        socket: &mut SharedTcpSocket<N>,
-        remote: SocketAddrV4,
-        yielder: Yielder,
-    ) -> Result<(), Fail> {
+    pub async fn connect(&mut self, socket: &mut SharedTcpSocket<N>, remote: SocketAddrV4) -> Result<(), Fail> {
         // Check whether we need to allocate an ephemeral port.
         let local: SocketAddrV4 = match socket.local() {
             Some(addr) => addr,
             None => {
-                // TODO: we should free this when closing.
-                // FIXME: https://github.com/microsoft/demikernel/issues/236
                 let local_port: u16 = self.runtime.alloc_ephemeral_port()?;
                 SocketAddrV4::new(self.local_ipv4_addr, local_port)
             },
@@ -174,7 +166,7 @@ impl<N: NetworkRuntime> SharedTcpPeer<N> {
         }
         let local_isn: SeqNumber = self.isn_generator.generate(&local, &remote);
         // Wait for connect to complete.
-        if let Err(e) = socket.connect(local, remote, local_isn, yielder).await {
+        if let Err(e) = socket.connect(local, remote, local_isn).await {
             self.addresses.remove(&SocketId::Active(local, remote.clone()));
             Err(e)
         } else {
@@ -183,15 +175,10 @@ impl<N: NetworkRuntime> SharedTcpPeer<N> {
     }
 
     /// Pushes immediately to the socket and returns the result asynchronously.
-    pub async fn push(
-        &self,
-        socket: &mut SharedTcpSocket<N>,
-        buf: &mut DemiBuffer,
-        yielder: Yielder,
-    ) -> Result<(), Fail> {
+    pub async fn push(&self, socket: &mut SharedTcpSocket<N>, buf: &mut DemiBuffer) -> Result<(), Fail> {
         // TODO: Remove this copy after merging with the transport trait.
         // Wait for push to complete.
-        socket.push(buf.clone(), yielder).await?;
+        socket.push(buf.clone()).await?;
         buf.trim(buf.len())
     }
 
@@ -199,27 +186,39 @@ impl<N: NetworkRuntime> SharedTcpPeer<N> {
     pub async fn pop(
         &self,
         socket: &mut SharedTcpSocket<N>,
-        buf: &mut DemiBuffer,
         size: usize,
-        yielder: Yielder,
-    ) -> Result<Option<SocketAddr>, Fail> {
+    ) -> Result<(Option<SocketAddr>, DemiBuffer), Fail> {
         // Grab the queue, make sure it hasn't been closed in the meantime.
         // This will bump the Rc refcount so the coroutine can have it's own reference to the shared queue data
         // structure and the SharedTcpQueue will not be freed until this coroutine finishes.
-        let incoming: DemiBuffer = socket.pop(Some(size), yielder).await?;
-        let len: usize = incoming.len();
-        // TODO: Remove this copy. Our API should support passing back a buffer without sending in a buffer.
-        buf.trim(size - len)?;
-        buf.copy_from_slice(&incoming[0..len]);
-        Ok(None)
+        let incoming: DemiBuffer = socket.pop(Some(size)).await?;
+        Ok((None, incoming))
+    }
+
+    /// Frees an ephemeral port (if any) allocated to a given socket.
+    fn free_ephemeral_port(&mut self, socket_id: &SocketId) {
+        let local: &SocketAddrV4 = match socket_id {
+            SocketId::Active(local, _) => local,
+            SocketId::Passive(local) => local,
+        };
+        // Rollback ephemeral port allocation.
+        if SharedDemiRuntime::is_private_ephemeral_port(local.port()) {
+            if self.runtime.free_ephemeral_port(local.port()).is_err() {
+                // We fail if and only if we attempted to free a port that was not allocated.
+                // This is unexpected, but if it happens, issue a warning and keep going,
+                // otherwise we would leave the queue in a dangling state.
+                warn!("bind(): leaking ephemeral port (port={})", local.port());
+            }
+        }
     }
 
     /// Closes a TCP socket.
-    pub async fn close(&mut self, socket: &mut SharedTcpSocket<N>, yielder: Yielder) -> Result<(), Fail> {
+    pub async fn close(&mut self, socket: &mut SharedTcpSocket<N>) -> Result<(), Fail> {
         // Wait for close to complete.
         // Handle result: If unsuccessful, free the new queue descriptor.
-        if let Some(socket_id) = socket.close(yielder).await? {
+        if let Some(socket_id) = socket.close().await? {
             self.addresses.remove(&socket_id);
+            self.free_ephemeral_port(&socket_id);
         }
         Ok(())
     }
@@ -227,6 +226,7 @@ impl<N: NetworkRuntime> SharedTcpPeer<N> {
     pub fn hard_close(&mut self, socket: &mut SharedTcpSocket<N>) -> Result<(), Fail> {
         if let Some(socket_id) = socket.hard_close()? {
             self.addresses.remove(&socket_id);
+            self.free_ephemeral_port(&socket_id);
         }
         Ok(())
     }

@@ -52,6 +52,10 @@ use std::{
 // Structures
 //==============================================================================
 
+/// A default amount of time to wait on an operation to complete. This was chosen arbitrarily to be quite small to make
+/// timeouts fast.
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1);
+
 pub struct DummyLibOS(SharedNetworkLibOS<SharedInetStack<SharedDummyRuntime>>);
 
 //==============================================================================
@@ -99,16 +103,27 @@ impl DummyLibOS {
     }
 
     #[allow(dead_code)]
-    pub fn wait(&mut self, qt: QToken, timeout: Duration) -> Result<(QDesc, OperationResult), Fail> {
-        let now: Instant = Instant::now();
-        // Run for one second.
-        while !self.get_runtime().has_completed(qt)? && Instant::now() - now < timeout {
-            self.get_runtime().poll();
+    pub fn wait(&mut self, qt: QToken, timeout: Option<Duration>) -> Result<(QDesc, OperationResult), Fail> {
+        // First check if the task has already completed.
+        if let Some(result) = self.get_runtime().get_completed_task(&qt) {
+            return Ok(result);
         }
-        match self.get_runtime().remove_coroutine(qt).get_result() {
-            Some(result) => Ok(result),
-            None => Err(Fail::new(libc::ETIMEDOUT, "wait timed out after one second")),
+
+        // Otherwise, actually run the scheduler.
+        // Put the QToken into a single element array.
+        let qt_array: [QToken; 1] = [qt];
+        let start: Instant = Instant::now();
+
+        // Call run_any() until the task finishes.
+        while Instant::now() <= start + timeout.unwrap_or(DEFAULT_TIMEOUT) {
+            // Run for one quanta and if one of our queue tokens completed, then return.
+            if let Some((offset, qd, qr)) = self.get_runtime().run_any(&qt_array) {
+                debug_assert_eq!(offset, 0);
+                return Ok((qd, qr));
+            }
         }
+
+        Err(Fail::new(libc::ETIMEDOUT, "wait timed out"))
     }
 }
 

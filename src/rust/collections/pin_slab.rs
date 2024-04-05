@@ -103,20 +103,58 @@ impl<T> PinSlab<T> {
         Some(key)
     }
 
-    /// Access the given key as a pinned mutable value.
-    pub fn get_pin_mut(&mut self, key: usize) -> Option<Pin<&mut T>> {
+    /// Checks whether the given slot is occupied.
+    pub fn contains(&self, key: usize) -> bool {
+        // We are just using this to check the existance of an entry in this slot or not.
+        self.internal_get(key).is_some()
+    }
+
+    /// Gets a read only unpinned reference.
+    pub fn get(&self, key: usize) -> Option<&T> {
+        self.internal_get(key)
+    }
+
+    #[allow(unused)]
+    /// Gets a read only pinned reference.
+    pub fn get_pin(&self, key: usize) -> Option<Pin<&T>> {
+        let entry: &T = self.internal_get(key)?;
         // Safety: all storage is pre-allocated in chunks, and each chunk
         // doesn't move. We only provide mutators to drop the storage through
         // `remove` (but it doesn't return it).
-        unsafe {
-            let entry: &mut T = self.internal_get_mut(key)?;
-            Some(Pin::new_unchecked(entry))
-        }
+        unsafe { Some(Pin::new_unchecked(entry)) }
+    }
+
+    /// Access the given key as a pinned mutable value.
+    pub fn get_pin_mut(&mut self, key: usize) -> Option<Pin<&mut T>> {
+        let entry: &mut T = self.internal_get_mut(key)?;
+        // Safety: all storage is pre-allocated in chunks, and each chunk
+        // doesn't move. We only provide mutators to drop the storage through
+        // `remove` (but it doesn't return it).
+        unsafe { Some(Pin::new_unchecked(entry)) }
+    }
+
+    /// Get a reference to the value at the given slot.
+    #[inline(always)]
+    fn internal_get(&self, key: usize) -> Option<&T> {
+        let (slot, offset, len): (usize, usize, usize) = calculate_key(key)?;
+        let slot: NonNull<Entry<T>> = *self.slots.get(slot)?;
+
+        // Safety: all slots are fully allocated and initialized in `new_slot`.
+        // As long as we have access to it, we know that we will only find
+        // initialized entries assuming offset < len.
+        debug_assert!(offset < len);
+
+        let entry: &T = match unsafe { &*slot.as_ptr().add(offset) } {
+            Entry::Occupied(entry) => entry,
+            _ => return None,
+        };
+
+        Some(entry)
     }
 
     /// Get a mutable reference to the value at the given slot.
     #[inline(always)]
-    unsafe fn internal_get_mut(&mut self, key: usize) -> Option<&mut T> {
+    fn internal_get_mut(&mut self, key: usize) -> Option<&mut T> {
         let (slot, offset, len): (usize, usize, usize) = calculate_key(key)?;
         let slot: NonNull<Entry<T>> = *self.slots.get_mut(slot)?;
 
@@ -125,7 +163,7 @@ impl<T> PinSlab<T> {
         // initialized entries assuming offset < len.
         debug_assert!(offset < len);
 
-        let entry: &mut T = match &mut *slot.as_ptr().add(offset) {
+        let entry: &mut T = match unsafe { &mut *slot.as_ptr().add(offset) } {
             Entry::Occupied(entry) => entry,
             _ => return None,
         };
