@@ -217,7 +217,7 @@ impl ConcurrentRingBuffer {
         let first_len: usize = if pop_offset + pop_len + HEADER_SIZE > self.capacity() {
             self.capacity() - first_offset
         } else {
-            len
+            pop_len
         };
         let buf_ptr: *mut u8 = buf.as_mut_ptr();
         let ring_ptr: *const u8 = unsafe { self.buffer.get().as_ptr() };
