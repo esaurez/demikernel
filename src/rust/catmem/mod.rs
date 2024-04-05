@@ -12,7 +12,6 @@ use self::queue::SharedCatmemQueue;
 use crate::{
     demikernel::config::Config,
     expect_ok,
-    pal::linux::socketaddrv4_to_sockaddr,
     runtime::{
         fail::Fail,
         limits,
@@ -43,6 +42,12 @@ use ::std::{
     },
     time::Duration,
 };
+
+#[cfg(target_os = "windows")]
+use crate::pal::functions::socketaddrv4_to_sockaddr;
+
+#[cfg(target_os = "linux")]
+use crate::pal::linux::socketaddrv4_to_sockaddr;
 
 //======================================================================================================================
 // Structures
