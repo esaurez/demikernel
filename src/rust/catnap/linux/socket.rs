@@ -10,6 +10,7 @@ use crate::{
         active_socket::ActiveSocketData,
         passive_socket::PassiveSocketData,
     },
+    expect_some,
     runtime::{
         fail::Fail,
         memory::DemiBuffer,
@@ -18,10 +19,6 @@ use crate::{
 };
 use ::socket2::Socket;
 use ::std::{
-    convert::{
-        AsMut,
-        AsRef,
-    },
     net::SocketAddr,
     ops::{
         Deref,
@@ -68,7 +65,7 @@ impl SharedSocketData {
     /// Moves an inactive socket to a passive listening socket.
     pub fn move_socket_to_passive(&mut self) {
         let socket: Socket = match self.deref_mut() {
-            SocketData::Inactive(socket) => socket.take().expect("should have data"),
+            SocketData::Inactive(socket) => expect_some!(socket.take(), "should have data"),
             SocketData::Active(_) => unreachable!("should not be able to move an active socket to a passive one"),
             SocketData::Passive(_) => return,
         };
@@ -78,7 +75,7 @@ impl SharedSocketData {
     /// Moves an inactive socket to an active established socket.
     pub fn move_socket_to_active(&mut self) {
         let socket: Socket = match self.deref_mut() {
-            SocketData::Inactive(socket) => socket.take().expect("should have data"),
+            SocketData::Inactive(socket) => expect_some!(socket.take(), "should have data"),
             SocketData::Active(_) => return,
             SocketData::Passive(_) => unreachable!("should not be able to move a passive socket to an active one"),
         };
@@ -131,10 +128,10 @@ impl SharedSocketData {
     }
 
     /// Pop some data on an active established connection.
-    pub async fn pop(&mut self, buf: &mut DemiBuffer, size: usize) -> Result<Option<SocketAddr>, Fail> {
+    pub async fn pop(&mut self, size: usize) -> Result<(Option<SocketAddr>, DemiBuffer), Fail> {
         match self.deref_mut() {
             SocketData::Inactive(_) => unreachable!("Cannot read on an inactive socket"),
-            SocketData::Active(data) => data.pop(buf, size).await,
+            SocketData::Active(data) => data.pop(size).await,
             SocketData::Passive(_) => unreachable!("Cannot read on a passive socket"),
         }
     }

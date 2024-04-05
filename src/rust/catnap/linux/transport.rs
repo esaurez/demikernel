@@ -19,9 +19,14 @@ use crate::{
         SocketData,
     },
     demikernel::config::Config,
+    expect_ok,
+    expect_some,
     runtime::{
         fail::Fail,
-        memory::DemiBuffer,
+        memory::{
+            DemiBuffer,
+            MemoryRuntime,
+        },
         network::transport::NetworkTransport,
         poll_yield,
         DemiRuntime,
@@ -102,12 +107,13 @@ impl SharedCatnapTransport {
             runtime: runtime.clone(),
         }));
         let mut me2: Self = me.clone();
-        runtime
-            .insert_background_coroutine(
+        expect_ok!(
+            runtime.insert_background_coroutine(
                 "catnap::transport::epoll",
                 Box::pin(async move { me2.poll().await }.fuse()),
-            )
-            .expect("should be able to insert background coroutine");
+            ),
+            "should be able to insert background coroutine"
+        );
         me
     }
 
@@ -184,30 +190,34 @@ impl SharedCatnapTransport {
             };
             while let Some(event) = events.pop() {
                 let offset: usize = event.u64 as usize;
-                if event.events | (libc::EPOLLIN as u32) != 0 {
+                if event.events & (libc::EPOLLIN as u32) != 0 {
                     // Wake pop.
-                    self.socket_table
-                        .get_mut(offset)
-                        .expect("should have allocated this when epoll was registered")
-                        .poll_in();
+                    expect_some!(
+                        self.socket_table.get_mut(offset),
+                        "should have allocated this when epoll was registered"
+                    )
+                    .poll_in();
                 }
-                if event.events | (libc::EPOLLOUT as u32) != 0 {
+                if event.events & (libc::EPOLLOUT as u32) != 0 {
                     // Wake push.
-                    self.socket_table
-                        .get_mut(offset)
-                        .expect("should have allocated this when epoll was registered")
-                        .poll_out();
+                    expect_some!(
+                        self.socket_table.get_mut(offset),
+                        "should have allocated this when epoll was registered"
+                    )
+                    .poll_out();
                 }
-                if event.events | (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32) != 0 {
+                if event.events & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32) != 0 {
                     // Wake both push and pop.
-                    self.socket_table
-                        .get_mut(offset)
-                        .expect("should have allocated this when epoll was registered")
-                        .poll_in();
-                    self.socket_table
-                        .get_mut(offset)
-                        .expect("should have allocated this when epoll was registered")
-                        .poll_out();
+                    expect_some!(
+                        self.socket_table.get_mut(offset),
+                        "should have allocated this when epoll was registered"
+                    )
+                    .poll_in();
+                    expect_some!(
+                        self.socket_table.get_mut(offset),
+                        "should have allocated this when epoll was registered"
+                    )
+                    .poll_out();
                 }
             }
             // Yield for one iteration.
@@ -217,10 +227,7 @@ impl SharedCatnapTransport {
 
     /// Internal function to get the raw file descriptor from a socket, given the socket descriptor.
     fn raw_fd_from_sd(&self, sd: &SockDesc) -> RawFd {
-        self.socket_table
-            .get(*sd)
-            .expect("shoudld have been allocated")
-            .as_raw_fd()
+        expect_some!(self.socket_table.get(*sd), "shoudld have been allocated").as_raw_fd()
     }
 
     /// Internal function to get the Socket from the metadata structure, given the socket descriptor.
@@ -230,7 +237,7 @@ impl SharedCatnapTransport {
 
     /// Internal function to get the metadata for the socket, given the socket descriptor.
     fn data_from_sd(&mut self, sd: &SockDesc) -> &mut SharedSocketData {
-        self.socket_table.get_mut(*sd).expect("should have been allocated")
+        expect_some!(self.socket_table.get_mut(*sd), "should have been allocated")
     }
 }
 
@@ -240,7 +247,7 @@ impl SharedCatnapTransport {
 
 /// Internal function to extract the raw OS error code.
 fn get_libc_err(e: io::Error) -> i32 {
-    e.raw_os_error().expect("should have an os error code")
+    expect_some!(e.raw_os_error(), "should have an os error code")
 }
 
 //======================================================================================================================
@@ -328,6 +335,26 @@ impl NetworkTransport for SharedCatnapTransport {
     fn bind(&mut self, sd: &mut Self::SocketDescriptor, local: SocketAddr) -> Result<(), Fail> {
         trace!("Bind to {:?}", local);
         let socket: &mut Socket = self.socket_from_sd(sd);
+
+        // Set SO_REUSE_PORT.
+        let optval: libc::c_int = 1;
+        let optval_len: libc::socklen_t = std::mem::size_of_val(&optval) as libc::socklen_t;
+        if unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                optval_len,
+            )
+        } < 0
+        {
+            let e: i32 = get_libc_err(io::Error::last_os_error());
+            let cause: String = format!("failed to bind socket: {:?}", e);
+            error!("bind(): {}", cause);
+            return Err(Fail::new(e, &cause));
+        }
+
         if let Err(e) = socket.bind(&local.into()) {
             let cause: String = format!("failed to bind socket: {:?}", e);
             error!("bind(): {}", cause);
@@ -422,7 +449,7 @@ impl NetworkTransport for SharedCatnapTransport {
                         libc::ENOTCONN => break,
                         errno if DemiRuntime::should_retry(errno) => {
                             // Wait for a new incoming event.
-                            data.pop(&mut DemiBuffer::new(0), 0).await?;
+                            data.pop(0).await?;
                             continue;
                         },
                         errno => return Err(Fail::new(errno, "operation failed")),
@@ -451,7 +478,7 @@ impl NetworkTransport for SharedCatnapTransport {
         {
             self.data_from_sd(sd).push(addr, buf.clone()).await?;
             // Clear out the original buffer.
-            buf.trim(buf.len()).expect("Should be able to empty the buffer");
+            expect_ok!(buf.trim(buf.len()), "Should be able to empty the buffer");
             Ok(())
         }
     }
@@ -462,10 +489,9 @@ impl NetworkTransport for SharedCatnapTransport {
     async fn pop(
         &mut self,
         sd: &mut Self::SocketDescriptor,
-        buf: &mut DemiBuffer,
         size: usize,
-    ) -> Result<Option<SocketAddr>, Fail> {
-        self.data_from_sd(sd).pop(buf, size).await
+    ) -> Result<(Option<SocketAddr>, DemiBuffer), Fail> {
+        self.data_from_sd(sd).pop(size).await
     }
 
     /// Close the socket on the underlying transport. Also unregisters the socket with epoll.
@@ -500,3 +526,5 @@ impl NetworkTransport for SharedCatnapTransport {
         &self.runtime
     }
 }
+
+impl MemoryRuntime for SharedCatnapTransport {}

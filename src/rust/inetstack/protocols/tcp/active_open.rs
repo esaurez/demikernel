@@ -7,6 +7,8 @@
 
 use crate::{
     collections::async_queue::SharedAsyncQueue,
+    expect_ok,
+    expect_some,
     inetstack::protocols::{
         arp::SharedArpPeer,
         ethernet2::{
@@ -47,7 +49,6 @@ use crate::{
 };
 use ::futures::channel::mpsc;
 use ::std::{
-    convert::TryInto,
     net::SocketAddrV4,
     ops::{
         Deref,
@@ -187,17 +188,23 @@ impl<N: NetworkRuntime> SharedActiveOpenSocket<N> {
         // TODO(RFC1323): Clamp the scale to 14 instead of panicking.
         assert!(local_window_scale <= 14 && remote_window_scale <= 14);
 
-        let rx_window_size: u32 = (self.tcp_config.get_receive_window_size())
-            .checked_shl(local_window_scale as u32)
-            .expect("TODO: Window size overflow")
-            .try_into()
-            .expect("TODO: Window size overflow");
+        let rx_window_size: u32 = expect_ok!(
+            expect_some!(
+                (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale as u32),
+                "TODO: Window size overflow"
+            )
+            .try_into(),
+            "TODO: Window size overflow"
+        );
 
-        let tx_window_size: u32 = (header.window_size)
-            .checked_shl(remote_window_scale as u32)
-            .expect("TODO: Window size overflow")
-            .try_into()
-            .expect("TODO: Window size overflow");
+        let tx_window_size: u32 = expect_ok!(
+            expect_some!(
+                (header.window_size as u32).checked_shl(remote_window_scale as u32),
+                "TODO: Window size overflow"
+            )
+            .try_into(),
+            "TODO: Window size overflow"
+        );
 
         info!("Window sizes: local {}, remote {}", rx_window_size, tx_window_size);
         info!(

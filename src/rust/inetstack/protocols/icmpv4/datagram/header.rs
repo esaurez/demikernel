@@ -13,7 +13,6 @@ use crate::{
     },
 };
 use ::libc::EBADMSG;
-use ::std::convert::TryInto;
 
 /// Size of ICMPv4 Headers (in bytes)
 pub const ICMPV4_HEADER_SIZE: usize = 8;

@@ -11,6 +11,7 @@ use crate::{
         async_queue::AsyncQueue,
         async_value::SharedAsyncValue,
     },
+    expect_ok,
     runtime::{
         fail::Fail,
         limits,
@@ -84,8 +85,10 @@ impl ActiveSocketData {
                 // Operation completed.
                 Ok(nbytes) => {
                     trace!("data pushed ({:?}/{:?} bytes)", nbytes, buf.len());
-                    buf.adjust(nbytes as usize)
-                        .expect("OS should not have sent more bytes than in the buffer");
+                    expect_ok!(
+                        buf.adjust(nbytes as usize),
+                        "OS should not have sent more bytes than in the buffer"
+                    );
                     if buf.is_empty() {
                         // Done sending this buffer
                         result.set(Some(Ok(())));
@@ -164,26 +167,18 @@ impl ActiveSocketData {
     }
 
     /// Pops data from the socket. Blocks until some data is found but does not wait until the buf has reached [size].
-    pub async fn pop(&mut self, buf: &mut DemiBuffer, size: usize) -> Result<Option<SocketAddr>, Fail> {
-        let (addr, mut incoming_buf): (Option<SocketAddr>, DemiBuffer) = self.recv_queue.pop(None).await??;
+    pub async fn pop(&mut self, size: usize) -> Result<(Option<SocketAddr>, DemiBuffer), Fail> {
+        let (addr, mut incoming): (Option<SocketAddr>, DemiBuffer) = self.recv_queue.pop(None).await??;
         // Figure out how much data we got.
-        let bytes_read: usize = min(incoming_buf.len(), size);
-        // Trim the buffer down to the amount that we received.
-        buf.trim(buf.len() - bytes_read)
-            .expect("DemiBuffer must be bigger than size");
-        // Move it if the buffer isn't empty.
-        if !incoming_buf.is_empty() {
-            buf.copy_from_slice(&incoming_buf[0..bytes_read]);
+        let bytes_read: usize = min(incoming.len(), size);
+        // Trim the buffer and leave for next read if we got more than expected.
+        if let Ok(remainder) = incoming.split_back(bytes_read) {
+            if !remainder.is_empty() {
+                self.recv_queue.push_front(Ok((addr.clone(), remainder)));
+            }
         }
-        // Trim off everything that we moved.
-        incoming_buf
-            .adjust(bytes_read)
-            .expect("bytes_read will be less than incoming buf len because it is a min of incoming buf len and size ");
-        // We didn't consume all of the incoming data.
-        if !incoming_buf.is_empty() {
-            self.recv_queue.push_front(Ok((addr, incoming_buf)));
-        }
-        Ok(addr)
+
+        Ok((addr, incoming))
     }
 
     pub fn get_socket(&self) -> &Socket {

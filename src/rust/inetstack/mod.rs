@@ -8,6 +8,7 @@
 use crate::{
     demi_sgarray_t,
     demikernel::config::Config,
+    expect_some,
     inetstack::protocols::{
         arp::SharedArpPeer,
         ethernet2::{
@@ -60,7 +61,6 @@ use ::std::{
     },
 };
 
-#[cfg(feature = "profiler")]
 use crate::timer;
 
 //======================================================================================================================
@@ -143,8 +143,7 @@ impl<N: NetworkRuntime> SharedInetStack<N> {
             network,
             local_link_addr: local_link_addr,
         }));
-        let background_task: String = format!("inetstack::poll_recv");
-        runtime.insert_background_coroutine(&background_task, Box::pin(me.clone().poll().fuse()))?;
+        runtime.insert_background_coroutine("inetstack::poll_recv", Box::pin(me.clone().poll().fuse()))?;
         Ok(me)
     }
 
@@ -152,19 +151,16 @@ impl<N: NetworkRuntime> SharedInetStack<N> {
     /// Then ask the runtime to receive new data which we will forward to the engine to parse and
     /// route to the correct protocol.
     pub async fn poll(mut self) {
-        #[cfg(feature = "profiler")]
         timer!("inetstack::poll");
         loop {
             for _ in 0..MAX_RECV_ITERS {
                 let batch = {
-                    #[cfg(feature = "profiler")]
                     timer!("inetstack::poll_bg_work::for::receive");
 
                     self.network.receive()
                 };
 
                 {
-                    #[cfg(feature = "profiler")]
                     timer!("inetstack::poll_bg_work::for::for");
 
                     if batch.is_empty() {
@@ -356,7 +352,7 @@ impl<N: NetworkRuntime> NetworkTransport for SharedInetStack<N> {
         match sd {
             Socket::Tcp(socket) => {
                 let socket = self.ipv4.tcp.accept(socket).await?;
-                let addr = socket.remote().expect("accepted socket must have an endpoint");
+                let addr = expect_some!(socket.remote(), "accepted socket must have an endpoint");
                 Ok((Socket::Tcp(socket), addr.into()))
             },
             // This queue descriptor does not concern a TCP socket.
@@ -431,12 +427,11 @@ impl<N: NetworkRuntime> NetworkTransport for SharedInetStack<N> {
     async fn pop(
         &mut self,
         sd: &mut Self::SocketDescriptor,
-        buf: &mut DemiBuffer,
         size: usize,
-    ) -> Result<Option<SocketAddr>, Fail> {
+    ) -> Result<(Option<SocketAddr>, DemiBuffer), Fail> {
         match sd {
-            Socket::Tcp(socket) => self.ipv4.tcp.pop(socket, buf, size).await,
-            Socket::Udp(socket) => self.ipv4.udp.pop(socket, buf, size).await,
+            Socket::Tcp(socket) => self.ipv4.tcp.pop(socket, size).await,
+            Socket::Udp(socket) => self.ipv4.udp.pop(socket, size).await,
         }
     }
 
@@ -447,7 +442,7 @@ impl<N: NetworkRuntime> NetworkTransport for SharedInetStack<N> {
 
 /// This implements the memory runtime trait for the inetstack. Other libOSes without a network runtime can directly
 /// use OS memory but the inetstack requires specialized memory allocated by the lower-level runtime.
-impl<N: NetworkRuntime> MemoryRuntime for InetStack<N> {
+impl<N: NetworkRuntime + MemoryRuntime> MemoryRuntime for SharedInetStack<N> {
     fn clone_sgarray(&self, sga: &demi_sgarray_t) -> Result<DemiBuffer, Fail> {
         self.network.clone_sgarray(sga)
     }

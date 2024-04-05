@@ -13,6 +13,7 @@
 
 use crate::{
     collections::id_map::IdMap,
+    expect_some,
     runtime::{
         scheduler::{
             group::TaskGroup,
@@ -152,10 +153,10 @@ impl Scheduler {
     }
 
     fn poll_notified_task_and_remove_if_ready(&mut self) -> Option<Box<dyn Task>> {
-        let group: &mut TaskGroup = self
-            .groups
-            .get_mut(self.current_group_id.into())
-            .expect("task group should exist: ");
+        let group: &mut TaskGroup = expect_some!(
+            self.groups.get_mut(self.current_group_id.into()),
+            "task group should exist: "
+        );
         assert!(self.current_running_task.is_none());
         *self.current_running_task = Some(group.unchecked_internal_to_external_id(self.current_task_id));
         assert!(self.current_running_task.is_some());
@@ -236,6 +237,8 @@ impl Scheduler {
             if self.current_group_id == starting_group_index {
                 return;
             }
+            // Update the current_group_id
+            self.current_group_id = self.get_next_group_index();
         }
     }
 
@@ -245,6 +248,7 @@ impl Scheduler {
         InternalId::from((usize::from(self.current_group_id) + 1) % self.groups.len())
     }
 
+    #[allow(unused)]
     /// Returns whether this task id points to a valid task.
     pub fn is_valid_task(&self, task_id: &TaskId) -> bool {
         if let Some(group) = self.get_group(task_id) {
@@ -350,12 +354,15 @@ impl From<InternalId> for u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::scheduler::{
-        scheduler::{
-            Scheduler,
-            TaskId,
+    use crate::{
+        expect_some,
+        runtime::scheduler::{
+            scheduler::{
+                Scheduler,
+                TaskId,
+            },
+            task::TaskWithResult,
         },
-        task::TaskWithResult,
     };
     use ::anyhow::Result;
     use ::futures::FutureExt;
@@ -411,13 +418,13 @@ mod tests {
         let mut scheduler: Scheduler = Scheduler::default();
 
         // Insert a task and make sure the task id is not a simple counter.
-        let task: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(0).fuse()));
+        let task: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(0).fuse()));
         let Some(task_id) = scheduler.insert_task(task) else {
             anyhow::bail!("insert() failed")
         };
 
         // Insert another task and make sure the task id is not sequentially after the previous one.
-        let task2: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(0).fuse()));
+        let task2: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(0).fuse()));
         let Some(task_id2) = scheduler.insert_task(task2) else {
             anyhow::bail!("insert() failed")
         };
@@ -432,7 +439,7 @@ mod tests {
         let mut scheduler: Scheduler = Scheduler::default();
 
         // Insert a single future in the scheduler. This future shall complete with a single poll operation.
-        let task: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(0).fuse()));
+        let task: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(0).fuse()));
         let Some(task_id) = scheduler.insert_task(task) else {
             anyhow::bail!("insert() failed")
         };
@@ -452,7 +459,7 @@ mod tests {
         let mut scheduler: Scheduler = Scheduler::default();
 
         // Insert a single future in the scheduler. This future shall complete with a single poll operation.
-        let task: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(0).fuse()));
+        let task: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(0).fuse()));
         let Some(task_id) = scheduler.insert_task(task) else {
             anyhow::bail!("insert() failed")
         };
@@ -473,7 +480,7 @@ mod tests {
 
         // Insert a single future in the scheduler. This future shall complete
         // with two poll operations.
-        let task: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(1).fuse()));
+        let task: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(1).fuse()));
         let Some(task_id) = scheduler.insert_task(task) else {
             anyhow::bail!("insert() failed")
         };
@@ -499,7 +506,7 @@ mod tests {
         let mut scheduler: Scheduler = Scheduler::default();
 
         // Insert a single future in the scheduler. This future shall complete with a single poll operation.
-        let task: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(0).fuse()));
+        let task: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(0).fuse()));
         let Some(task_id) = scheduler.insert_task(task) else {
             anyhow::bail!("insert() failed")
         };
@@ -520,7 +527,7 @@ mod tests {
         let mut scheduler: Scheduler = Scheduler::default();
 
         // Create and run a task.
-        let task: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(0).fuse()));
+        let task: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(0).fuse()));
         let Some(task_id) = scheduler.insert_task(task) else {
             anyhow::bail!("insert() failed")
         };
@@ -532,7 +539,7 @@ mod tests {
         }
 
         // Create another task.
-        let task2: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(0).fuse()));
+        let task2: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(0).fuse()));
         let Some(task_id2) = scheduler.insert_task(task2) else {
             anyhow::bail!("insert() failed")
         };
@@ -554,7 +561,7 @@ mod tests {
         crate::ensure_eq!(scheduler.num_tasks(), 0);
 
         for val in 0..NUM_TASKS {
-            let task: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(val).fuse()));
+            let task: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(val).fuse()));
             let Some(task_id) = scheduler.insert_task(task) else {
                 panic!("insert() failed");
             };
@@ -584,13 +591,8 @@ mod tests {
         let mut scheduler: Scheduler = Scheduler::default();
 
         b.iter(|| {
-            let task: DummyTask = DummyTask::new(
-                String::from("testing"),
-                Box::pin(black_box(DummyCoroutine::default().fuse())),
-            );
-            let task_id: TaskId = scheduler
-                .insert_task(task)
-                .expect("couldn't insert future in scheduler");
+            let task: DummyTask = DummyTask::new("testing", Box::pin(black_box(DummyCoroutine::default().fuse())));
+            let task_id: TaskId = expect_some!(scheduler.insert_task(task), "couldn't insert future in scheduler");
             black_box(task_id);
         });
     }
@@ -602,7 +604,7 @@ mod tests {
         let mut task_ids: Vec<TaskId> = Vec::<TaskId>::with_capacity(NUM_TASKS);
 
         for val in 0..NUM_TASKS {
-            let task: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(val).fuse()));
+            let task: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(val).fuse()));
             let Some(task_id) = scheduler.insert_task(task) else {
                 panic!("insert() failed");
             };
@@ -621,7 +623,7 @@ mod tests {
         let mut task_ids: Vec<TaskId> = Vec::<TaskId>::with_capacity(NUM_TASKS);
 
         for val in 0..NUM_TASKS {
-            let task: DummyTask = DummyTask::new(String::from("testing"), Box::pin(DummyCoroutine::new(val).fuse()));
+            let task: DummyTask = DummyTask::new("testing", Box::pin(DummyCoroutine::new(val).fuse()));
             let Some(task_id) = scheduler.insert_task(task) else {
                 panic!("insert() failed");
             };

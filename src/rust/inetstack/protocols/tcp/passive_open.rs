@@ -10,6 +10,8 @@ use crate::{
         AsyncQueue,
         SharedAsyncQueue,
     },
+    expect_ok,
+    expect_some,
     inetstack::protocols::{
         arp::SharedArpPeer,
         ethernet2::{
@@ -59,7 +61,6 @@ use ::libc::{
 };
 use ::std::{
     collections::HashMap,
-    convert::TryInto,
     net::SocketAddrV4,
     ops::{
         Deref,
@@ -407,14 +408,18 @@ impl<N: NetworkRuntime> SharedPassiveSocket<N> {
             Some(w) => (self.tcp_config.get_window_scale() as u32, w),
             None => (0, 0),
         };
-        let remote_window_size = (header_window_size)
-            .checked_shl(remote_window_scale as u32)
-            .expect("TODO: Window size overflow")
-            .try_into()
-            .expect("TODO: Window size overflow");
-        let local_window_size = (self.tcp_config.get_receive_window_size() as u32)
-            .checked_shl(local_window_scale as u32)
-            .expect("TODO: Window size overflow");
+        let remote_window_size = expect_ok!(
+            expect_some!(
+                (header_window_size as u32).checked_shl(remote_window_scale as u32),
+                "TODO: Window size overflow"
+            )
+            .try_into(),
+            "TODO: Window size overflow"
+        );
+        let local_window_size = expect_some!(
+            (self.tcp_config.get_receive_window_size() as u32).checked_shl(local_window_scale as u32),
+            "TODO: Window size overflow"
+        );
         info!(
             "Window sizes: local {}, remote {}",
             local_window_size, remote_window_size

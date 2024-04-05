@@ -16,6 +16,7 @@ use crate::{
         id_map::IdMap,
         pin_slab::PinSlab,
     },
+    expect_some,
     runtime::scheduler::{
         page::{
             WakerPageRef,
@@ -65,11 +66,8 @@ impl TaskGroup {
     /// Given a handle to a task, remove it from the scheduler
     pub fn remove(&mut self, task_id: TaskId) -> Option<Box<dyn Task>> {
         // We should not have a scheduler handle that refers to an invalid id, so unwrap and expect are safe here.
-        let pin_slab_index: usize = self
-            .ids
-            .remove(&task_id)
-            .expect("Token should be in the token table")
-            .into();
+        let pin_slab_index: usize =
+            expect_some!(self.ids.remove(&task_id), "Token should be in the token table").into();
         let (waker_page_ref, waker_page_offset): (&WakerPageRef, usize) = {
             let (waker_page_index, waker_page_offset) = self.get_waker_page_index_and_offset(pin_slab_index)?;
             (&self.waker_page_refs[waker_page_index], waker_page_offset)
@@ -94,7 +92,7 @@ impl TaskGroup {
 
     /// Insert a new task into our scheduler returning a handle corresponding to it.
     pub fn insert(&mut self, task: Box<dyn Task>) -> Option<TaskId> {
-        let task_name: String = task.get_name();
+        let task_name: &'static str = task.get_name();
         // The pin slab index can be reverse-computed in a page index and an offset within the page.
         let pin_slab_index: usize = self.tasks.insert(task)?;
         let task_id: TaskId = self.ids.insert_with_new_id(pin_slab_index.into());
@@ -115,10 +113,7 @@ impl TaskGroup {
             pin_slab_index
         );
         // Set this task's id.
-        self.tasks
-            .get_pin_mut(pin_slab_index)
-            .expect("just allocated!")
-            .set_id(task_id);
+        expect_some!(self.tasks.get_pin_mut(pin_slab_index), "just allocated!").set_id(task_id);
         Some(task_id)
     }
 
@@ -170,23 +165,20 @@ impl TaskGroup {
 
     /// Translates an internal task id to an external one. Expects the task to exist.
     pub fn unchecked_internal_to_external_id(&self, internal_id: InternalId) -> TaskId {
-        self.tasks
-            .get(internal_id.into())
-            .expect(format!("Invalid offset: {:?}", internal_id).as_str())
-            .get_id()
+        expect_some!(self.tasks.get(internal_id.into()), "Invalid offset: {:?}", internal_id).get_id()
     }
 
     pub fn unchecked_external_to_internal_id(&self, task_id: &TaskId) -> InternalId {
-        self.ids
-            .get(task_id)
-            .expect(format!("Invalid id: {:?}", task_id).as_str())
+        expect_some!(self.ids.get(task_id), "Invalid id: {:?}", task_id)
     }
 
     fn get_pinned_task_ptr(&mut self, pin_slab_index: usize) -> Pin<&mut Box<dyn Task>> {
         // Get the pinned ref.
-        self.tasks
-            .get_pin_mut(pin_slab_index)
-            .expect(format!("Invalid offset: {:?}", pin_slab_index).as_str())
+        expect_some!(
+            self.tasks.get_pin_mut(pin_slab_index),
+            "Invalid offset: {:?}",
+            pin_slab_index
+        )
     }
 
     pub fn get_waker(&self, internal_task_id: InternalId) -> Option<Waker> {

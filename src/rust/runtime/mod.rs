@@ -35,16 +35,19 @@ pub use dpdk_rs as libdpdk;
 // Imports
 //======================================================================================================================
 
+use crate::runtime::network::{
+    ephemeral::EphemeralPorts,
+    socket::SocketId,
+    NetworkQueueTable,
+};
+
+#[cfg(feature = "profiler")]
+use crate::coroutine_timer;
+
 use crate::{
-    pal::data_structures::SockAddr,
+    expect_some,
     runtime::{
         fail::Fail,
-        memory::MemoryRuntime,
-        network::{
-            ephemeral::EphemeralPorts,
-            socket::SocketId,
-            NetworkQueueTable,
-        },
         poll::PollFuture,
         queue::{
             IoQueue,
@@ -53,13 +56,6 @@ use crate::{
         scheduler::{
             SharedScheduler,
             TaskWithResult,
-        },
-        timer::SharedTimer,
-        types::{
-            demi_accept_result_t,
-            demi_opcode_t,
-            demi_qr_value_t,
-            demi_qresult_t,
         },
     },
 };
@@ -72,22 +68,13 @@ use ::futures::{
 
 use ::std::{
     any::Any,
-    boxed::Box,
     collections::HashMap,
-    convert::{
-        AsMut,
-        AsRef,
-    },
-    mem,
     net::SocketAddrV4,
     ops::{
         Deref,
         DerefMut,
     },
-    pin::{
-        pin,
-        Pin,
-    },
+    pin::pin,
     rc::Rc,
     time::{
         Duration,
@@ -95,24 +82,7 @@ use ::std::{
         SystemTime,
     },
 };
-
-#[cfg(target_os = "windows")]
-use crate::pal::functions::socketaddrv4_to_sockaddr;
-
-#[cfg(target_os = "linux")]
-use crate::pal::linux::socketaddrv4_to_sockaddr;
-
-//======================================================================================================================
-// Thread local variable
-//======================================================================================================================
-
-thread_local! {
-/// Each Demikernel thread has its own instance of the scheduler stored in a thread local variable for access from
-/// different coroutines. It is important to note that this is NEVER accessed directly from outside of the runtime.
-static THREAD_SCHEDULER: SharedScheduler = SharedScheduler::default();
-/// This is our shared sense of time. It is explicitly moved forward ONLY by the runtime and used to trigger time outs.
-static THREAD_TIME: SharedTimer = SharedTimer::default();
-}
+use std::pin::Pin;
 
 //======================================================================================================================
 // Constants
@@ -128,6 +98,8 @@ const TIMER_RESOLUTION: usize = 64;
 pub struct DemiRuntime {
     /// Shared IoQueueTable.
     qtable: IoQueueTable,
+    /// Shared coroutine scheduler.
+    scheduler: SharedScheduler,
     /// Shared ephemeral port allocator.
     ephemeral_ports: EphemeralPorts,
     /// Shared table for mapping from underlying transport identifiers to queue descriptors.
@@ -164,12 +136,10 @@ impl DemiRuntime {
 impl SharedDemiRuntime {
     #[cfg(test)]
     pub fn new(now: Instant) -> Self {
-        THREAD_TIME.with(|s| {
-            s.clone().set_time(now);
-        });
-
+        timer::global_set_time(now);
         Self(SharedObject::<DemiRuntime>::new(DemiRuntime {
             qtable: IoQueueTable::default(),
+            scheduler: SharedScheduler::default(),
             ephemeral_ports: EphemeralPorts::default(),
             network_table: NetworkQueueTable::default(),
             ts_iters: 0,
@@ -178,28 +148,37 @@ impl SharedDemiRuntime {
     }
 
     /// Inserts the `coroutine` named `task_name` into the scheduler.
-    pub fn insert_io_coroutine(&mut self, task_name: &str, coroutine: Pin<Box<Operation>>) -> Result<QToken, Fail> {
+    pub fn insert_io_coroutine<F: FusedFuture<Output = (QDesc, OperationResult)> + 'static>(
+        &mut self,
+        task_name: &'static str,
+        coroutine: Pin<Box<F>>,
+    ) -> Result<QToken, Fail> {
         self.insert_coroutine(task_name, coroutine)
     }
 
     /// Inserts the background `coroutine` named `task_name` into the scheduler
-    pub fn insert_background_coroutine(
+    pub fn insert_background_coroutine<F: FusedFuture<Output = ()> + 'static>(
         &mut self,
-        task_name: &str,
-        coroutine: Pin<Box<dyn FusedFuture<Output = ()>>>,
+        task_name: &'static str,
+        coroutine: Pin<Box<F>>,
     ) -> Result<QToken, Fail> {
         self.insert_coroutine(task_name, coroutine)
     }
 
     /// Inserts a coroutine of type T and task
-    pub fn insert_coroutine<R: Unpin + Clone + Any>(
+    pub fn insert_coroutine<F: FusedFuture + 'static>(
         &mut self,
-        task_name: &str,
-        coroutine: Pin<Box<dyn FusedFuture<Output = R>>>,
-    ) -> Result<QToken, Fail> {
+        task_name: &'static str,
+        coroutine: Pin<Box<F>>,
+    ) -> Result<QToken, Fail>
+    where
+        F::Output: Unpin + Clone + Any,
+    {
         trace!("Inserting coroutine: {:?}", task_name);
-        let task: TaskWithResult<R> = TaskWithResult::<R>::new(task_name.to_string(), coroutine);
-        match THREAD_SCHEDULER.with(|s| s.clone().insert_task(task)) {
+        #[cfg(feature = "profiler")]
+        let coroutine = coroutine_timer!(task_name, coroutine);
+        let task: TaskWithResult<F::Output> = TaskWithResult::<F::Output>::new(task_name, coroutine);
+        match self.scheduler.insert_task(task) {
             Some(task_id) => Ok(task_id.into()),
             None => {
                 let cause: String = format!("cannot schedule coroutine (task_name={:?})", &task_name);
@@ -210,24 +189,21 @@ impl SharedDemiRuntime {
     }
 
     /// This is just a single-token convenience wrapper for wait_any().
-    pub fn wait(&mut self, qt: QToken, timeout: Duration) -> Result<demi_qresult_t, Fail> {
+    pub fn wait(&mut self, qt: QToken, timeout: Duration) -> Result<(usize, QToken, QDesc, OperationResult), Fail> {
         trace!("wait(): qt={:?}, timeout={:?}", qt, timeout);
 
         // Put the QToken into a single element array.
         let qt_array: [QToken; 1] = [qt];
 
         // Call wait_any() to do the real work.
-        let (offset, qr): (usize, demi_qresult_t) = self.wait_any(&qt_array, timeout)?;
-        debug_assert_eq!(offset, 0);
-        Ok(qr)
+        self.wait_any(&qt_array, timeout)
     }
 
-    pub fn timedwait(&mut self, qt: QToken, abstime: Option<SystemTime>) -> Result<demi_qresult_t, Fail> {
+    pub fn timedwait(&mut self, qt: QToken, abstime: Option<SystemTime>) -> Result<(QDesc, OperationResult), Fail> {
         if let Some((qd, result)) = self.completed_tasks.remove(&qt) {
-            let result: demi_qresult_t = self.create_result(result, qd, qt);
-            return Ok(result);
+            return Ok((qd, result));
         }
-        if !THREAD_SCHEDULER.with(|s| s.is_valid_task(&TaskId::from(qt))) {
+        if !self.scheduler.is_valid_task(&TaskId::from(qt)) {
             let cause: String = format!("{:?} is not a valid queue token", qt);
             warn!("wait_any: {}", cause);
             return Err(Fail::new(libc::EINVAL, &cause));
@@ -237,19 +213,18 @@ impl SharedDemiRuntime {
         self.advance_clock_to_now();
 
         loop {
-            if let Some(boxed_task) = THREAD_SCHEDULER.with(|s| s.clone().get_next_completed_task(TIMER_RESOLUTION)) {
+            if let Some(boxed_task) = self.scheduler.get_next_completed_task(TIMER_RESOLUTION) {
                 // Perform bookkeeping for the completed and removed task.
                 trace!("Removing coroutine: {:?}", boxed_task.get_name());
                 let completed_qt: QToken = boxed_task.get_id().into();
                 // If an operation task (and not a background task), then check the task to see if it is one of ours.
-                if let Ok(operation_task) = OperationTask::try_from(boxed_task.as_any()) {
+                if let Ok(mut operation_task) = OperationTask::try_from(boxed_task.as_any()) {
                     let (qd, result): (QDesc, OperationResult) =
-                        operation_task.get_result().expect("coroutine not finished");
+                        expect_some!(operation_task.get_result(), "coroutine not finished");
 
                     // Check whether it matches any of the queue tokens that we are waiting on.
                     if completed_qt == qt {
-                        let result: demi_qresult_t = self.create_result(result, qd, qt);
-                        return Ok(result);
+                        return Ok((qd, result));
                     }
 
                     // If not a queue token that we are waiting on, then insert into our list of completed tasks.
@@ -269,15 +244,19 @@ impl SharedDemiRuntime {
     }
 
     /// Waits until one of the tasks in qts has completed and returns the result.
-    pub fn wait_any(&mut self, qts: &[QToken], timeout: Duration) -> Result<(usize, demi_qresult_t), Fail> {
+    pub fn wait_any(
+        &mut self,
+        qts: &[QToken],
+        timeout: Duration,
+    ) -> Result<(usize, QToken, QDesc, OperationResult), Fail> {
         for (i, qt) in qts.iter().enumerate() {
             // 1. Check if any of these queue tokens point to already completed tasks.
             if let Some((qd, result)) = self.get_completed_task(&qt) {
-                return Ok((i, self.create_result(result, qd, *qt)));
+                return Ok((i, *qt, qd, result));
             }
 
             // 2. Make sure these queue tokens all point to valid tasks.
-            if !THREAD_SCHEDULER.with(|s| s.is_valid_task(&TaskId::from(*qt))) {
+            if !self.scheduler.is_valid_task(&TaskId::from(*qt)) {
                 let cause: String = format!("{:?} is not a valid queue token", qt);
                 warn!("wait_any: {}", cause);
                 return Err(Fail::new(libc::EINVAL, &cause));
@@ -292,7 +271,7 @@ impl SharedDemiRuntime {
         loop {
             // Run for one quanta and if one of our queue tokens completed, then return.
             if let Some((i, qd, result)) = self.run_any(qts) {
-                return Ok((i, self.create_result(result, qd, qts[i])));
+                return Ok((i, qts[i], qd, result));
             }
             // Otherwise, move time forward.
             self.advance_clock_to_now();
@@ -309,15 +288,15 @@ impl SharedDemiRuntime {
 
     /// Runs the scheduler for one [TIMER_RESOLUTION] quanta. Importantly does not modify the clock.
     pub fn run_any(&mut self, qts: &[QToken]) -> Option<(usize, QDesc, OperationResult)> {
-        if let Some(boxed_task) = THREAD_SCHEDULER.with(|s| s.clone().get_next_completed_task(TIMER_RESOLUTION)) {
+        if let Some(boxed_task) = self.scheduler.get_next_completed_task(TIMER_RESOLUTION) {
             // Perform bookkeeping for the completed and removed task.
             trace!("Removing coroutine: {:?}", boxed_task.get_name());
             let qt: QToken = boxed_task.get_id().into();
 
             // If an operation task, then take a look at the result.
-            if let Ok(operation_task) = OperationTask::try_from(boxed_task.as_any()) {
+            if let Ok(mut operation_task) = OperationTask::try_from(boxed_task.as_any()) {
                 let (qd, result): (QDesc, OperationResult) =
-                    operation_task.get_result().expect("coroutine not finished");
+                    expect_some!(operation_task.get_result(), "coroutine not finished");
 
                 // Check whether it matches any of the queue tokens that we are waiting on.
                 for i in 0..qts.len() {
@@ -336,13 +315,13 @@ impl SharedDemiRuntime {
     /// Performs a single pool on the underlying scheduler.
     pub fn poll(&mut self) {
         // For all ready tasks that were removed from the scheduler, add to our completed task list.
-        for boxed_task in THREAD_SCHEDULER.with(|s| s.clone().poll_all()) {
+        for boxed_task in self.scheduler.poll_all() {
             trace!("Completed while polling coroutine: {:?}", boxed_task.get_name());
             let qt: QToken = boxed_task.get_id().into();
 
-            if let Ok(operation_task) = OperationTask::try_from(boxed_task.as_any()) {
+            if let Ok(mut operation_task) = OperationTask::try_from(boxed_task.as_any()) {
                 let (qd, result): (QDesc, OperationResult) =
-                    operation_task.get_result().expect("coroutine not finished");
+                    expect_some!(operation_task.get_result(), "coroutine not finished");
                 self.completed_tasks.insert(qt, (qd, result));
             }
         }
@@ -432,7 +411,7 @@ impl SharedDemiRuntime {
 
     /// Moves time forward deterministically.
     pub fn advance_clock(&mut self, now: Instant) {
-        THREAD_TIME.with(|t| t.clone().advance_clock(now));
+        timer::global_advance_clock(now)
     }
 
     /// Moves time forward to the current real time.
@@ -445,7 +424,7 @@ impl SharedDemiRuntime {
 
     /// Gets the current time according to our internal timer.
     pub fn get_now(&self) -> Instant {
-        THREAD_TIME.with(|t| t.now())
+        timer::global_get_time()
     }
 
     /// Checks if an identifier is in use and returns the queue descriptor if it is.
@@ -489,83 +468,6 @@ impl SharedDemiRuntime {
         trace!("Check address in use: {:?}", local);
         self.network_table.addr_in_use(local)
     }
-
-    pub fn create_result(&self, result: OperationResult, qd: QDesc, qt: QToken) -> demi_qresult_t {
-        match result {
-            OperationResult::Connect => demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_CONNECT,
-                qr_qd: qd.into(),
-                qr_qt: qt.into(),
-                qr_ret: 0,
-                qr_value: unsafe { mem::zeroed() },
-            },
-            OperationResult::Accept((new_qd, addr)) => {
-                let saddr: SockAddr = socketaddrv4_to_sockaddr(&addr);
-                let qr_value: demi_qr_value_t = demi_qr_value_t {
-                    ares: demi_accept_result_t {
-                        qd: new_qd.into(),
-                        addr: saddr,
-                    },
-                };
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_ACCEPT,
-                    qr_qd: qd.into(),
-                    qr_qt: qt.into(),
-                    qr_ret: 0,
-                    qr_value,
-                }
-            },
-            OperationResult::Push => demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_PUSH,
-                qr_qd: qd.into(),
-                qr_qt: qt.into(),
-                qr_ret: 0,
-                qr_value: unsafe { mem::zeroed() },
-            },
-            OperationResult::Pop(addr, bytes) => match self.into_sgarray(bytes) {
-                Ok(mut sga) => {
-                    if let Some(addr) = addr {
-                        sga.sga_addr = socketaddrv4_to_sockaddr(&addr);
-                    }
-                    let qr_value: demi_qr_value_t = demi_qr_value_t { sga };
-                    demi_qresult_t {
-                        qr_opcode: demi_opcode_t::DEMI_OPC_POP,
-                        qr_qd: qd.into(),
-                        qr_qt: qt.into(),
-                        qr_ret: 0,
-                        qr_value,
-                    }
-                },
-                Err(e) => {
-                    warn!("Operation Failed: {:?}", e);
-                    demi_qresult_t {
-                        qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                        qr_qd: qd.into(),
-                        qr_qt: qt.into(),
-                        qr_ret: e.errno as i64,
-                        qr_value: unsafe { mem::zeroed() },
-                    }
-                },
-            },
-            OperationResult::Close => demi_qresult_t {
-                qr_opcode: demi_opcode_t::DEMI_OPC_CLOSE,
-                qr_qd: qd.into(),
-                qr_qt: qt.into(),
-                qr_ret: 0,
-                qr_value: unsafe { mem::zeroed() },
-            },
-            OperationResult::Failed(e) => {
-                warn!("Operation Failed: {:?}", e);
-                demi_qresult_t {
-                    qr_opcode: demi_opcode_t::DEMI_OPC_FAILED,
-                    qr_qd: qd.into(),
-                    qr_qt: qt.into(),
-                    qr_ret: e.errno as i64,
-                    qr_value: unsafe { mem::zeroed() },
-                }
-            },
-        }
-    }
 }
 
 impl<T> SharedObject<T> {
@@ -584,24 +486,15 @@ impl<T: ?Sized> SharedBox<T> {
 // Static Functions
 //======================================================================================================================
 
-/// Check whether this task (and therefore its waker) is still valid.
-fn is_valid_task_id(task_id: &TaskId) -> bool {
-    THREAD_SCHEDULER.with(|s| s.is_valid_task(task_id))
-}
-
 pub async fn yield_with_timeout(timeout: Duration) {
-    let timer_cond: SharedConditionVariable = SharedConditionVariable::default();
-    THREAD_TIME.with(|t| t.clone().wait(timeout, timer_cond.clone())).await
+    timer::wait(timeout).await
 }
 
 /// Yield until either the condition completes or we time out. If the timeout is 0, then run
 pub async fn conditional_yield_with_timeout<F: Future>(condition: F, timeout: Duration) -> Result<F::Output, Fail> {
-    let mut timer_cond: SharedConditionVariable = SharedConditionVariable::default();
     select_biased! {
-        result = pin!(condition.fuse()) => {
-            timer_cond.cancel();
-            Ok(result)},
-        _ = THREAD_TIME.with(|t| {t.clone().wait(timeout, timer_cond.clone()).fuse()}) => Err(Fail::new(libc::ETIMEDOUT, "a conditional wait timed out"))
+        result = pin!(condition.fuse()) => Ok(result),
+        _ = timer::wait(timeout).fuse() => Err(Fail::new(libc::ETIMEDOUT, "a conditional wait timed out"))
     }
 }
 
@@ -609,12 +502,9 @@ pub async fn conditional_yield_with_timeout<F: Future>(condition: F, timeout: Du
 /// the condition completes.
 pub async fn conditional_yield_until<F: Future>(condition: F, expiry: Option<Instant>) -> Result<F::Output, Fail> {
     if let Some(expiry) = expiry {
-        let mut timer_cond: SharedConditionVariable = SharedConditionVariable::default();
         select_biased! {
-            result = pin!(condition.fuse()) => {
-                timer_cond.cancel();
-                Ok(result)},
-            _ = THREAD_TIME.with(|t| {t.clone().wait_until(expiry, timer_cond.clone()).fuse()}) => Err(Fail::new(libc::ETIMEDOUT, "a conditional wait timed out"))
+            result = pin!(condition.fuse()) => Ok(result),
+            _ = timer::wait_until(expiry).fuse() => Err(Fail::new(libc::ETIMEDOUT, "a conditional wait timed out"))
         }
     } else {
         Ok(condition.await)
@@ -631,18 +521,12 @@ pub async fn poll_yield() {
 // Trait Implementations
 //======================================================================================================================
 
-/// Memory Runtime Trait Implementation for POSIX Runtime
-impl MemoryRuntime for SharedDemiRuntime {}
-
 impl Default for SharedDemiRuntime {
     fn default() -> Self {
-        let now: Instant = Instant::now();
-        THREAD_TIME.with(|s| {
-            s.clone().set_time(now);
-        });
-
+        timer::global_set_time(Instant::now());
         Self(SharedObject::<DemiRuntime>::new(DemiRuntime {
             qtable: IoQueueTable::default(),
+            scheduler: SharedScheduler::default(),
             ephemeral_ports: EphemeralPorts::default(),
             network_table: NetworkQueueTable::default(),
             ts_iters: 0,
@@ -737,3 +621,88 @@ impl DerefMut for SharedDemiRuntime {
 
 /// Demikernel Runtime
 pub trait Runtime: Clone + Unpin + 'static {}
+
+//======================================================================================================================
+// Benchmarks
+//======================================================================================================================
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::{
+        poll_yield,
+        OperationResult,
+        QDesc,
+        QToken,
+        SharedDemiRuntime,
+    };
+    use futures::FutureExt;
+    use test::Bencher;
+
+    async fn dummy_coroutine(iterations: usize) -> (QDesc, OperationResult) {
+        for _ in 0..iterations {
+            poll_yield().await;
+        }
+        (QDesc::from(0), OperationResult::Close)
+    }
+
+    async fn dummy_background_coroutine() {
+        loop {
+            poll_yield().await
+        }
+    }
+
+    #[bench]
+    fn benchmark_insert_io_coroutine(b: &mut Bencher) {
+        let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
+
+        b.iter(|| runtime.insert_io_coroutine("dummy coroutine", Box::pin(dummy_coroutine(10).fuse())));
+    }
+
+    #[bench]
+    fn benchmark_insert_background_coroutine(b: &mut Bencher) {
+        let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
+
+        b.iter(|| {
+            runtime.insert_background_coroutine(
+                "dummy background coroutine",
+                Box::pin(dummy_background_coroutine().fuse()),
+            )
+        });
+    }
+
+    #[bench]
+    fn benchmark_run_any(b: &mut Bencher) {
+        const NUM_TASKS: usize = 1024;
+        let mut qts: [QToken; NUM_TASKS] = [QToken::from(0); NUM_TASKS];
+        let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
+        // Insert a large number of coroutines.
+        for i in 0..NUM_TASKS {
+            // Make the arg big enough that the coroutine doesn't exit.
+            qts[i] = runtime
+                .insert_io_coroutine("dummy coroutine", Box::pin(dummy_coroutine(1000000000).fuse()))
+                .expect("should be able to insert tasks");
+        }
+
+        // Run all of the tasks for one quanta
+        b.iter(|| runtime.run_any(&qts));
+    }
+
+    #[bench]
+    fn benchmark_run_any_background(b: &mut Bencher) {
+        const NUM_TASKS: usize = 1024;
+        let mut qts: [QToken; NUM_TASKS] = [QToken::from(0); NUM_TASKS];
+        let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
+        // Insert a large number of coroutines.
+        for i in 0..NUM_TASKS {
+            qts[i] = runtime
+                .insert_background_coroutine(
+                    "dummy background coroutine",
+                    Box::pin(dummy_background_coroutine().fuse()),
+                )
+                .expect("should be able to insert tasks");
+        }
+
+        // Run all of the tasks for one quanta
+        b.iter(|| runtime.run_any(&qts));
+    }
+}

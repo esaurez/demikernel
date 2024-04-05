@@ -20,7 +20,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     slice,
-    time::Instant,
+    time::Instant
 };
 
 #[cfg(target_os = "windows")]
@@ -59,7 +59,7 @@ pub struct TcpEchoClient {
     qts: Vec<QToken>,
     /// Reverse lookup table of pending operations.
     qts_reverse: HashMap<QToken, QDesc>,
-    // Time after the first message was completed
+    // Time after the first message was completed 
     start_time: HashMap<QDesc, Instant>,
 }
 
@@ -140,7 +140,7 @@ impl TcpEchoClient {
             }
 
             if let Some(nrequests) = nrequests {
-                // For each client print the average latency, using the start time in start_time
+                // For each client print the average latency, using the start time in start_time 
                 let time_now = Instant::now();
                 for (_qd, begin) in &self.start_time {
                     let time_elapsed: u64 = (time_now - *begin).as_nanos() as u64;

@@ -1,33 +1,43 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#[cfg(feature = "catmem-libos")]
 pub mod memory;
 pub mod name;
+#[cfg(any(
+    feature = "catnap-libos",
+    feature = "catnip-libos",
+    feature = "catpowder-libos",
+    feature = "catloop-libos"
+))]
 pub mod network;
 
 //======================================================================================================================
 // Imports
 //======================================================================================================================
 
-use self::{
-    memory::MemoryLibOS,
-    name::LibOSName,
-    network::NetworkLibOSWrapper,
-};
+#[cfg(feature = "catmem-libos")]
+use self::memory::MemoryLibOS;
+use self::name::LibOSName;
 #[cfg(feature = "catnip-libos")]
 use crate::catnip::runtime::SharedDPDKRuntime;
 #[cfg(feature = "catpowder-libos")]
 use crate::catpowder::runtime::LinuxRuntime;
+#[cfg(any(
+    feature = "catnap-libos",
+    feature = "catnip-libos",
+    feature = "catpowder-libos",
+    feature = "catloop-libos"
+))]
+use crate::demikernel::libos::network::{
+    libos::SharedNetworkLibOS,
+    NetworkLibOSWrapper,
+};
 #[cfg(any(feature = "catpowder-libos", feature = "catnip-libos"))]
 use crate::inetstack::SharedInetStack;
-#[cfg(feature = "profiler")]
-use crate::timer;
 
 use crate::{
-    demikernel::{
-        config::Config,
-        libos::network::libos::SharedNetworkLibOS,
-    },
+    demikernel::config::Config,
     runtime::{
         fail::Fail,
         limits,
@@ -40,6 +50,7 @@ use crate::{
         QToken,
         SharedDemiRuntime,
     },
+    timer,
 };
 use ::std::{
     env,
@@ -51,7 +62,7 @@ use ::std::{
 use crate::catloop::transport::SharedCatloopTransport;
 #[cfg(feature = "catmem-libos")]
 use crate::catmem::SharedCatmemLibOS;
-#[cfg(all(feature = "catnap-libos"))]
+#[cfg(feature = "catnap-libos")]
 use crate::catnap::transport::SharedCatnapTransport;
 
 //======================================================================================================================
@@ -64,8 +75,15 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// LibOS
 pub enum LibOS {
     /// Network LibOS
+    #[cfg(any(
+        feature = "catnap-libos",
+        feature = "catnip-libos",
+        feature = "catpowder-libos",
+        feature = "catloop-libos"
+    ))]
     NetworkLibOS(NetworkLibOSWrapper),
     /// Memory LibOS
+    #[cfg(feature = "catmem-libos")]
     MemoryLibOS(MemoryLibOS),
 }
 
@@ -94,21 +112,17 @@ impl LibOS {
     pub fn new_with_config(libos_name: LibOSName, config: Config) -> Result<Self, Fail> {
         #[cfg(feature = "profiler")]
         timer!("demikernel::new");
-
         logging::initialize();
 
         let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
         // Instantiate LibOS.
         #[allow(unreachable_patterns)]
         let libos: LibOS = match libos_name {
-            #[cfg(all(feature = "catnap-libos"))]
-            LibOSName::Catnap => Self::NetworkLibOS(NetworkLibOSWrapper::Catnap {
-                runtime: runtime.clone(),
-                libos: SharedNetworkLibOS::<SharedCatnapTransport>::new(
-                    runtime.clone(),
-                    SharedCatnapTransport::new(&config, &mut runtime),
-                ),
-            }),
+            >::new(
+                runtime.clone(),
+                SharedCatnapTransport::new(&config, &mut runtime),
+            ))),
+
             #[cfg(feature = "catpowder-libos")]
             LibOSName::Catpowder => {
                 // TODO: Remove some of these clones once we are done merging the libOSes.
@@ -116,10 +130,11 @@ impl LibOS {
                 // This is our transport for Catpowder.
                 let inetstack: SharedInetStack<LinuxRuntime> =
                     SharedInetStack::<LinuxRuntime>::new(config.clone(), runtime.clone(), transport).unwrap();
-                Self::NetworkLibOS(NetworkLibOSWrapper::Catpowder {
-                    runtime: runtime.clone(),
-                    libos: SharedNetworkLibOS::<SharedInetStack<LinuxRuntime>>::new(runtime.clone(), inetstack),
-                })
+                Self::NetworkLibOS(NetworkLibOSWrapper::Catpowder(SharedNetworkLibOS::<
+                    SharedInetStack<LinuxRuntime>,
+                >::new(
+                    runtime.clone(), inetstack
+                )))
             },
             #[cfg(feature = "catnip-libos")]
             LibOSName::Catnip => {
@@ -128,24 +143,23 @@ impl LibOS {
                 let inetstack: SharedInetStack<SharedDPDKRuntime> =
                     SharedInetStack::<SharedDPDKRuntime>::new(config.clone(), runtime.clone(), transport).unwrap();
 
-                Self::NetworkLibOS(NetworkLibOSWrapper::Catnip {
-                    runtime: runtime.clone(),
-                    libos: SharedNetworkLibOS::<SharedInetStack<SharedDPDKRuntime>>::new(runtime.clone(), inetstack),
-                })
+                Self::NetworkLibOS(NetworkLibOSWrapper::Catnip(SharedNetworkLibOS::<
+                    SharedInetStack<SharedDPDKRuntime>,
+                >::new(
+                    runtime.clone(), inetstack
+                )))
             },
             #[cfg(feature = "catmem-libos")]
-            LibOSName::Catmem => Self::MemoryLibOS(MemoryLibOS::Catmem {
-                runtime: runtime.clone(),
-                libos: SharedCatmemLibOS::new(&config, runtime.clone()),
-            }),
+            LibOSName::Catmem => {
+                Self::MemoryLibOS(MemoryLibOS::Catmem(SharedCatmemLibOS::new(&config, runtime.clone())))
+            },
             #[cfg(feature = "catloop-libos")]
-            LibOSName::Catloop => Self::NetworkLibOS(NetworkLibOSWrapper::Catloop {
-                runtime: runtime.clone(),
-                libos: SharedNetworkLibOS::<SharedCatloopTransport>::new(
-                    runtime.clone(),
-                    SharedCatloopTransport::new(&config, runtime.clone()),
-                ),
-            }),
+            LibOSName::Catloop => Self::NetworkLibOS(NetworkLibOSWrapper::Catloop(SharedNetworkLibOS::<
+                SharedCatloopTransport,
+            >::new(
+                runtime.clone(),
+                SharedCatloopTransport::new(&config, runtime.clone()),
+            ))),
             _ => panic!("unsupported libos"),
         };
 
@@ -153,15 +167,22 @@ impl LibOS {
     }
 
     /// Creates a new memory queue and connect to consumer end.
+    #[allow(unused_variables)]
     pub fn create_pipe(&mut self, name: &str) -> Result<QDesc, Fail> {
         let result: Result<QDesc, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::create_pipe");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(_) => Err(Fail::new(
                     libc::ENOTSUP,
                     "create_pipe() is not supported on network liboses",
                 )),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(libos) => libos.create_pipe(name),
             }
         };
@@ -172,15 +193,22 @@ impl LibOS {
     }
 
     /// Opens an existing memory queue and connects to producer end.
+    #[allow(unused_variables)]
     pub fn open_pipe(&mut self, name: &str) -> Result<QDesc, Fail> {
         let result: Result<QDesc, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::open_pipe");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(_) => Err(Fail::new(
                     libc::ENOTSUP,
                     "open_pipe() is not supported on network liboses",
                 )),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(libos) => libos.open_pipe(name),
             }
         };
@@ -191,6 +219,7 @@ impl LibOS {
     }
 
     /// Creates a socket.
+    #[allow(unused_variables)]
     pub fn socket(
         &mut self,
         domain: libc::c_int,
@@ -198,10 +227,16 @@ impl LibOS {
         protocol: libc::c_int,
     ) -> Result<QDesc, Fail> {
         let result: Result<QDesc, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::socket");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.socket(domain, socket_type, protocol),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(_) => Err(Fail::new(libc::ENOTSUP, "socket() is not supported on memory liboses")),
             }
         };
@@ -212,12 +247,19 @@ impl LibOS {
     }
 
     /// Binds a socket to a local address.
+    #[allow(unused_variables)]
     pub fn bind(&mut self, sockqd: QDesc, local: SocketAddr) -> Result<(), Fail> {
         let result: Result<(), Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::bind");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.bind(sockqd, local),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(_) => Err(Fail::new(libc::ENOTSUP, "bind() is not supported on memory liboses")),
             }
         };
@@ -228,12 +270,19 @@ impl LibOS {
     }
 
     /// Marks a socket as a passive one.
+    #[allow(unused_variables)]
     pub fn listen(&mut self, sockqd: QDesc, backlog: usize) -> Result<(), Fail> {
         let result: Result<(), Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::listen");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.listen(sockqd, backlog),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(_) => Err(Fail::new(libc::ENOTSUP, "listen() is not supported on memory liboses")),
             }
         };
@@ -244,12 +293,19 @@ impl LibOS {
     }
 
     /// Accepts an incoming connection on a TCP socket.
+    #[allow(unused_variables)]
     pub fn accept(&mut self, sockqd: QDesc) -> Result<QToken, Fail> {
         let result: Result<QToken, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::accept");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.accept(sockqd),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(_) => Err(Fail::new(libc::ENOTSUP, "accept() is not supported on memory liboses")),
             }
         };
@@ -260,12 +316,19 @@ impl LibOS {
     }
 
     /// Initiates a connection with a remote TCP socket.
+    #[allow(unused_variables)]
     pub fn connect(&mut self, sockqd: QDesc, remote: SocketAddr) -> Result<QToken, Fail> {
         let result: Result<QToken, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::connect");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.connect(sockqd, remote),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(_) => Err(Fail::new(libc::ENOTSUP, "connect() is not supported on memory liboses")),
             }
         };
@@ -279,9 +342,14 @@ impl LibOS {
     /// async_close() + wait() achieves the same effect as synchronous close.
     pub fn close(&mut self, qd: QDesc) -> Result<(), Fail> {
         let result: Result<(), Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::close");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => match libos.async_close(qd) {
                     Ok(qt) => match self.wait(qt, None) {
                         Ok(_) => Ok(()),
@@ -289,6 +357,7 @@ impl LibOS {
                     },
                     Err(e) => Err(e),
                 },
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(libos) => match libos.async_close(qd) {
                     Ok(qt) => match self.wait(qt, None) {
                         Ok(_) => Ok(()),
@@ -306,10 +375,16 @@ impl LibOS {
 
     pub fn async_close(&mut self, qd: QDesc) -> Result<QToken, Fail> {
         let result: Result<QToken, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::async_close");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.async_close(qd),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(libos) => libos.async_close(qd),
             }
         };
@@ -322,10 +397,16 @@ impl LibOS {
     /// Pushes a scatter-gather array to an I/O queue.
     pub fn push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<QToken, Fail> {
         let result: Result<QToken, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::push");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.push(qd, sga),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(libos) => libos.push(qd, sga),
             }
         };
@@ -336,12 +417,19 @@ impl LibOS {
     }
 
     /// Pushes a scatter-gather array to a UDP socket.
+    #[allow(unused_variables)]
     pub fn pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t, to: SocketAddr) -> Result<QToken, Fail> {
         let result: Result<QToken, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::pushto");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.pushto(qd, sga, to),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(_) => Err(Fail::new(libc::ENOTSUP, "pushto() is not supported on memory liboses")),
             }
         };
@@ -354,7 +442,6 @@ impl LibOS {
     /// Pops data from a an I/O queue.
     pub fn pop(&mut self, qd: QDesc, size: Option<usize>) -> Result<QToken, Fail> {
         let result: Result<QToken, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::pop");
 
             // Check if this is a fixed-size pop.
@@ -368,7 +455,14 @@ impl LibOS {
             }
 
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.pop(qd, size),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(libos) => libos.pop(qd, size),
             }
         };
@@ -381,20 +475,32 @@ impl LibOS {
     /// Waits for a pending I/O operation to complete or a timeout to expire.
     /// This is just a single-token convenience wrapper for wait_any().
     pub fn wait(&mut self, qt: QToken, timeout: Option<Duration>) -> Result<demi_qresult_t, Fail> {
-        #[cfg(feature = "profiler")]
         timer!("demikernel::wait");
         match self {
+            #[cfg(any(
+                feature = "catnap-libos",
+                feature = "catnip-libos",
+                feature = "catpowder-libos",
+                feature = "catloop-libos"
+            ))]
             LibOS::NetworkLibOS(libos) => libos.wait(qt, timeout.unwrap_or(DEFAULT_TIMEOUT)),
+            #[cfg(feature = "catmem-libos")]
             LibOS::MemoryLibOS(libos) => libos.wait(qt, timeout.unwrap_or(DEFAULT_TIMEOUT)),
         }
     }
 
     /// Waits for any of the given pending I/O operations to complete or a timeout to expire.
     pub fn wait_any(&mut self, qts: &[QToken], timeout: Option<Duration>) -> Result<(usize, demi_qresult_t), Fail> {
-        #[cfg(feature = "profiler")]
         timer!("demikernel::wait_any");
         match self {
+            #[cfg(any(
+                feature = "catnap-libos",
+                feature = "catnip-libos",
+                feature = "catpowder-libos",
+                feature = "catloop-libos"
+            ))]
             LibOS::NetworkLibOS(libos) => libos.wait_any(qts, timeout.unwrap_or(DEFAULT_TIMEOUT)),
+            #[cfg(feature = "catmem-libos")]
             LibOS::MemoryLibOS(libos) => libos.wait_any(qts, timeout.unwrap_or(DEFAULT_TIMEOUT)),
         }
     }
@@ -402,10 +508,16 @@ impl LibOS {
     /// Allocates a scatter-gather array.
     pub fn sgaalloc(&mut self, size: usize) -> Result<demi_sgarray_t, Fail> {
         let result: Result<demi_sgarray_t, Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::sgaalloc");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.sgaalloc(size),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(libos) => libos.sgaalloc(size),
             }
         };
@@ -416,10 +528,16 @@ impl LibOS {
     /// Releases a scatter-gather array.
     pub fn sgafree(&mut self, sga: demi_sgarray_t) -> Result<(), Fail> {
         let result: Result<(), Fail> = {
-            #[cfg(feature = "profiler")]
             timer!("demikernel::sgafree");
             match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
                 LibOS::NetworkLibOS(libos) => libos.sgafree(sga),
+                #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(libos) => libos.sgafree(sga),
             }
         };
@@ -428,10 +546,16 @@ impl LibOS {
     }
 
     fn poll(&mut self) {
-        #[cfg(feature = "profiler")]
         timer!("demikernel::poll");
         match self {
+            #[cfg(any(
+                feature = "catnap-libos",
+                feature = "catnip-libos",
+                feature = "catpowder-libos",
+                feature = "catloop-libos"
+            ))]
             LibOS::NetworkLibOS(libos) => libos.poll(),
+            #[cfg(feature = "catmem-libos")]
             LibOS::MemoryLibOS(libos) => libos.poll(),
         }
     }

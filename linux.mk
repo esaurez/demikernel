@@ -53,7 +53,7 @@ export LIBS := $(DEMIKERNEL_LIB)
 #=======================================================================================================================
 
 export LIBOS ?= catnap
-export CARGO_FEATURES := --features=$(LIBOS)-libos
+export CARGO_FEATURES := --features=$(LIBOS)-libos --no-default-features
 
 # Switch for DPDK
 ifeq ($(LIBOS),catnip)
@@ -62,7 +62,7 @@ CARGO_FEATURES += --features=$(DRIVER)
 endif
 
 # Switch for profiler.
-export PROFILER=no
+export PROFILER ?= no
 ifeq ($(PROFILER),yes)
 CARGO_FEATURES += --features=profiler
 endif

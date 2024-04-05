@@ -24,18 +24,19 @@ license-file = "LICENSE.txt"
 
 # Third Party
 arrayvec = "0.7.4"
-async-trait = "0.1.77"
-anyhow = "1.0.79"
+async-trait = "0.1.79"
+anyhow = "1.0.81"
 bit-iter = "1.2.0"
 cfg-if = "1.0.0"
 crc = "3.0.1"
-clap = "4.4.18"
-crossbeam-channel = "0.5.11"
+clap = "4.5.4"
+crossbeam-channel = "0.5.12"
 eui48 = "1.1.0"
-flexi_logger = "0.27.4"
+flexi_logger = "0.28.0"
 futures = "0.3.30"
+histogram = "0.9.1"
 libc = "0.2.153"
-log = "0.4.20"
+log = "0.4.21"
 mimalloc = { version = "0.1.39", default-features = false }
 nix = { version = "0.27.1", features = ["ioctl"] }
 rand = { version = "0.8.5", features = ["small_rng"] }
@@ -68,7 +69,7 @@ vm-memory = { version = "0.10.0", features = ["backend-mmap", "backend-atomic", 
 [target.'cfg(windows)'.dependencies]
 # libc implementation in Rust is quite different for Windows and Linux. This library provides the relevant networking
 # constants and data structures for Windows.
-windows = { version = "0.52.0", features = [
+windows = { version = "0.54.0", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Security",

@@ -2,21 +2,19 @@
 # Licensed under the MIT license.
 
 name: Main Catnapw
+
 concurrency:
   group: catnapw
   cancel-in-progress: false
 
 on:
+  pull_request:
+    types: [opened, synchronize]
   push:
     branches:
-      - bugfix-*
-      - enhancement-*
-      - feature-*
-      - workaround-*
-      - dev
+      - main
       - unstable
-      - master
-  workflow_dispatch:
+      - dev
 
 env:
   LIBOS: catnapw
@@ -33,6 +31,8 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - name: Setup SSH
       shell: bash
       run: |
@@ -48,13 +48,18 @@ jobs:
         echo -e "\tPort ${{ secrets.PORTNUM }}" >> $HOME/.ssh/config
     - name: Run
       run: |
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          branch_name="${{ github.head_ref }}"
+        else
+          branch_name="${{ github.ref_name }}"
+        fi
         pip install --pre azure-data-tables
         python3 tools/demikernel_ci.py \
           --server $SERVER \
           --client $CLIENT \
           --repository 'c:\demikernel' \
           --config-path 'c:\config.yaml' \
-          --branch origin/${{ github.ref_name }} \
+          --branch origin/$branch_name \
           --libos $LIBOS \
           --debug \
           --server-addr $SERVER_ADDR \
@@ -75,6 +80,8 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - name: Setup SSH
       shell: bash
       run: |
@@ -90,13 +97,18 @@ jobs:
         echo -e "\tPort ${{ secrets.PORTNUM }}" >> $HOME/.ssh/config
     - name: Run
       run: |
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          branch_name="${{ github.head_ref }}"
+        else
+          branch_name="${{ github.ref_name }}"
+        fi
         pip install --pre azure-data-tables
         python3 tools/demikernel_ci.py \
           --server $SERVER \
           --client $CLIENT \
           --repository 'c:\demikernel' \
           --config-path 'c:\config.yaml' \
-          --branch origin/${{ github.ref_name }} \
+          --branch origin/$branch_name \
           --libos $LIBOS \
           --server-addr $SERVER_ADDR \
           --client-addr $CLIENT_ADDR \

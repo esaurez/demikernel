@@ -33,6 +33,7 @@ use windows::Win32::{
 use crate::{
     catnap::transport::error::translate_ntstatus,
     collections::pin_slab::PinSlab,
+    expect_some,
     runtime::{
         fail::Fail,
         SharedConditionVariable,
@@ -182,7 +183,7 @@ impl<S: Unpin> IoCompletionPort<S> {
         };
         // Grab a reference to the new completion in the pin slab.
         let mut pinned_completion: Pin<&mut OverlappedCompletion<S>> =
-            self.ops.get_pin_mut(pinslab_index).expect("Just inserted this");
+            expect_some!(self.ops.get_pin_mut(pinslab_index), "Just inserted this");
 
         // Set the pinslab index so the I/O processor can remove it later if necessary.
         pinned_completion.as_mut().set_pinslab_index(pinslab_index);
@@ -191,7 +192,7 @@ impl<S: Unpin> IoCompletionPort<S> {
         let result: Result<R, Fail> = match start(pinned_completion.as_mut().get_state(), overlapped) {
             // Operation in progress, pending overlapped completion.
             Ok(()) => {
-                while let Some(cv) = pinned_completion.as_ref().get_cv() {
+                while let Some(mut cv) = pinned_completion.as_ref().get_cv() {
                     cv.wait().await;
                 }
 
@@ -335,7 +336,6 @@ mod tests {
         ensure_eq,
         runtime::{
             conditional_yield_with_timeout,
-            Operation,
             SharedDemiRuntime,
         },
         OperationResult,
@@ -522,7 +522,7 @@ mod tests {
         const COMPLETION_KEY: usize = 123;
         let mut iocp: IoCompletionPort<()> = make_iocp()?;
         let overlapped: OverlappedCompletion<()> = OverlappedCompletion::new(());
-        let cv: SharedConditionVariable = overlapped.condition_variable.clone().unwrap();
+        let mut cv: SharedConditionVariable = overlapped.condition_variable.clone().unwrap();
         pin_mut!(overlapped);
 
         // Insert coroutine
@@ -578,7 +578,7 @@ mod tests {
         iocp.get_mut().associate_handle(server_pipe.0, COMPLETION_KEY)?;
         let iocp_ref: &mut IoCompletionPort<Rc<Vec<u8>>> = unsafe { &mut *iocp.get() };
 
-        let server: Pin<Box<Operation>> = Box::pin(
+        let server = Box::pin(
             run_as_io_op(async move {
                 unsafe {
                     iocp_ref.do_io(

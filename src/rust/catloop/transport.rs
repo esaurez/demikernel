@@ -8,7 +8,10 @@ use crate::{
     demikernel::config::Config,
     runtime::{
         fail::Fail,
-        memory::DemiBuffer,
+        memory::{
+            DemiBuffer,
+            MemoryRuntime,
+        },
         network::{
             transport::NetworkTransport,
             unwrap_socketaddr,
@@ -146,10 +149,9 @@ impl NetworkTransport for SharedCatloopTransport {
     async fn pop(
         &mut self,
         sd: &mut Self::SocketDescriptor,
-        buf: &mut DemiBuffer,
         size: usize,
-    ) -> Result<Option<SocketAddr>, Fail> {
-        sd.pop(self.catmem.clone(), buf, size).await
+    ) -> Result<(Option<SocketAddr>, DemiBuffer), Fail> {
+        sd.pop(self.catmem.clone(), size).await
     }
 
     fn get_runtime(&self) -> &SharedDemiRuntime {
@@ -174,3 +176,5 @@ impl DerefMut for SharedCatloopTransport {
         self.0.deref_mut()
     }
 }
+
+impl MemoryRuntime for SharedCatloopTransport {}

@@ -38,7 +38,6 @@ use ::std::{
     },
 };
 
-#[cfg(feature = "profiler")]
 use crate::timer;
 
 //======================================================================================================================
@@ -150,20 +149,14 @@ impl<N: NetworkRuntime> SharedUdpPeer<N> {
     pub async fn pop(
         &mut self,
         socket: &mut SharedUdpSocket<N>,
-        buf: &mut DemiBuffer,
         size: usize,
-    ) -> Result<Option<SocketAddr>, Fail> {
-        let (addr, incoming): (SocketAddrV4, DemiBuffer) = socket.pop(size).await?;
-        // TODO: Remove copy.
-        let len: usize = incoming.len();
-        buf.trim(size - len)?;
-        buf.copy_from_slice(&incoming[0..len]);
-        Ok(Some(addr.into()))
+    ) -> Result<(Option<SocketAddr>, DemiBuffer), Fail> {
+        let (addr, buf) = socket.pop(size).await?;
+        Ok((Some(addr.into()), buf))
     }
 
     /// Consumes the payload from a buffer.
     pub fn receive(&mut self, ipv4_hdr: Ipv4Header, buf: DemiBuffer) {
-        #[cfg(feature = "profiler")]
         timer!("udp::receive");
         // Parse datagram.
         let (hdr, data): (UdpHeader, DemiBuffer) = match UdpHeader::parse(&ipv4_hdr, buf, self.checksum_offload) {
