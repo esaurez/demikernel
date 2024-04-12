@@ -165,8 +165,8 @@ impl Scope {
             percent,
             duration_sum_secs / (self.num_calls as f64),
             duration_sum_secs / (self.num_calls as f64) * ns_per_cycle,
-            self.min_duration * ns_per_cycle,
-            self.max_duration * ns_per_cycle,
+            (self.min_duration as f64) * ns_per_cycle,
+            (self.max_duration as f64) * ns_per_cycle,
         )?;
 
         // Write children
