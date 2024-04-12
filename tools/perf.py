@@ -77,9 +77,10 @@ def __build_report(table_name: str, connection_str: str, key: str, branch_name: 
     base_date = datetime.datetime.now() - datetime.timedelta(days=ndays)
     # print(f"Querying Azure Table for performance statistics since {base_date}...")
     datetime_filter: str = f"(Timestamp gt datetime'{base_date.strftime('%Y-%m-%dT%H:%M:%S.%fZ')}')"
+    scope_filter: str = f"(Scope eq 'NetworkLibOS')"
     libos_filter: str = f"(LibOS eq 'catnap' or LibOS eq 'catpowder' or LibOS eq 'catnip')"
     syscall_filter: str = f"(Syscall eq 'push' or Syscall eq 'pop')"
-    query_filter: str = f"{datetime_filter} and {libos_filter} and {syscall_filter}"
+    query_filter: str = f"{datetime_filter} and {scope_filter} and {libos_filter} and {syscall_filter}"
     select: List[str] = ["LibOS", "JobName", "CommitHash", "Syscall", "AverageCyclesPerSyscall"]
     data = table_client.query_entities(query_filter=query_filter, select=select)
 
@@ -147,13 +148,16 @@ def __process_data(data, job_types, syscalls, libos_types, root_commit, head_com
                                 if not (git.check_if_merge_commit(hash) or head_commit == hash):
                                     continue
 
-                                processed[(job_type, libos_type, hash, syscall)] = True
-                                cooked_data[job_type][syscall][libos_type]["diff"].append(
-                                    git.compute_commit_distance(root_commit, hash))
-                                cooked_data[job_type][syscall][libos_type]["cycles"].append(
-                                    row["AverageCyclesPerSyscall"])
-                                cooked_data[job_type][syscall][libos_type]["commit"].append(
-                                    git.get_short_commit_hash(hash))
+                                try:
+                                    processed[(job_type, libos_type, hash, syscall)] = True
+                                    cooked_data[job_type][syscall][libos_type]["diff"].append(
+                                        git.compute_commit_distance(root_commit, hash))
+                                    cooked_data[job_type][syscall][libos_type]["cycles"].append(
+                                        row["AverageCyclesPerSyscall"])
+                                    cooked_data[job_type][syscall][libos_type]["commit"].append(
+                                        git.get_short_commit_hash(hash))
+                                except:
+                                    print(f"Error processing commit {hash}")
     return cooked_data
 
 
