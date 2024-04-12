@@ -45,6 +45,12 @@ pub struct Scope {
 
     /// In total, how much time has been spent in this scope?
     duration_sum: u64,
+
+    /// Current min duration.
+    min_duration: u64,
+
+    /// Current max duration.
+    max_duration: u64,
 }
 
 /// A guard that is created when entering a scope and dropped when leaving it.
@@ -70,6 +76,8 @@ impl Scope {
             succs: Vec::new(),
             num_calls: 0,
             duration_sum: 0,
+            min_duration: u64::MAX,
+            max_duration: 0,
         }
     }
 
@@ -112,6 +120,14 @@ impl Scope {
 
         // Even though this is extremely unlikely, let's not panic on overflow.
         self.duration_sum = self.duration_sum + duration;
+
+        if self.min_duration > duration {
+            self.min_duration = duration;
+        }
+
+        if self.max_duration < duration {
+            self.max_duration = duration;
+        }
     }
 
     /// Dump statistics.
@@ -144,11 +160,13 @@ impl Scope {
         }
         writeln!(
             out,
-            "{};{};{};{}",
+            "{};{};{};{};{};{}",
             format!("{};{}", markers, self.name),
             percent,
             duration_sum_secs / (self.num_calls as f64),
             duration_sum_secs / (self.num_calls as f64) * ns_per_cycle,
+            min_duration * ns_per_cycle,
+            max_duration * ns_per_cycle,
         )?;
 
         // Write children
