@@ -88,7 +88,10 @@ use std::pin::Pin;
 // Constants
 //======================================================================================================================
 
-const TIMER_RESOLUTION: usize = 64;
+// TODO: Make this more accurate using rdtsc.
+// FIXME: https://github.com/microsoft/demikernel/issues/1226
+const TIMER_RESOLUTION: usize = 1024;
+const TIMER_FINER_RESOLUTION: usize = 16;
 
 //======================================================================================================================
 // Structures
@@ -265,19 +268,25 @@ impl SharedDemiRuntime {
 
         // 3. None of the tasks have already completed, so start a timer and move the clock.
         self.advance_clock_to_now();
-        let start: Instant = self.get_now();
+        let mut prev_time: Instant = self.get_now();
+        let mut remaining_time: Duration = timeout;
 
         // 4. Invoke the scheduler and run some tasks.
         loop {
             // Run for one quanta and if one of our queue tokens completed, then return.
-            if let Some((i, qd, result)) = self.run_any(qts) {
+            if let Some((i, qd, result)) = self.run_any(qts, remaining_time) {
                 return Ok((i, qts[i], qd, result));
             }
             // Otherwise, move time forward.
             self.advance_clock_to_now();
             let now: Instant = self.get_now();
-            if now >= start + timeout {
+            let time_elapsed: Duration = now - prev_time;
+
+            if time_elapsed > remaining_time {
                 return Err(Fail::new(libc::ETIMEDOUT, "wait timed out"));
+            } else {
+                remaining_time = remaining_time - time_elapsed;
+                prev_time = now;
             }
         }
     }
@@ -286,9 +295,74 @@ impl SharedDemiRuntime {
         self.completed_tasks.remove(qt)
     }
 
-    /// Runs the scheduler for one [TIMER_RESOLUTION] quanta. Importantly does not modify the clock.
-    pub fn run_any(&mut self, qts: &[QToken]) -> Option<(usize, QDesc, OperationResult)> {
-        if let Some(boxed_task) = self.scheduler.get_next_completed_task(TIMER_RESOLUTION) {
+    /// Waits until the next task is complete, passing the result to `acceptor`. The acceptor may return true to
+    /// continue waiting or false to exit the wait. The method will return when either the acceptor returns false
+    /// (returning Ok) or the timeout has expired (returning a Fail indicating timeout).
+    pub fn wait_next_n<Acceptor: FnMut(QToken, QDesc, OperationResult) -> bool>(
+        &mut self,
+        mut acceptor: Acceptor,
+        timeout: Duration,
+    ) -> Result<(), Fail> {
+        // 1. Check if any tasks are completed.
+        for (qt, (qd, result)) in self.completed_tasks.extract_if(|_, _| true) {
+            if acceptor(qt, qd, result) == false {
+                return Ok(());
+            }
+        }
+
+        // 2. None of the tasks have already completed, so start a timer and move the clock.
+        self.advance_clock_to_now();
+        let mut prev_time: Instant = self.get_now();
+        let mut remaining_time: Duration = timeout;
+
+        // 3. Invoke the scheduler and run some tasks.
+        loop {
+            // Run for one quanta and if one of our queue tokens completed, then return.
+            if let Some((qt, qd, result)) = self.run_next(remaining_time) {
+                if acceptor(qt, qd, result) == false {
+                    return Ok(());
+                }
+            }
+            // Otherwise, move time forward.
+            self.advance_clock_to_now();
+            let now: Instant = self.get_now();
+            let time_elapsed: Duration = now - prev_time;
+
+            if time_elapsed > remaining_time {
+                return Err(Fail::new(libc::ETIMEDOUT, "wait timed out"));
+            } else {
+                remaining_time = remaining_time - time_elapsed;
+                prev_time = now;
+            }
+        }
+    }
+
+    /// Runs the scheduler for one [TIMER_RESOLUTION] quanta, returning any task in `qts`. Importantly does not modify
+    /// the clock.
+    pub fn run_any(&mut self, qts: &[QToken], timeout: Duration) -> Option<(usize, QDesc, OperationResult)> {
+        if let Some((qt, qd, result)) = self.run_next(timeout) {
+            // Check whether it matches any of the queue tokens that we are waiting on.
+            for i in 0..qts.len() {
+                if qts[i] == qt {
+                    return Some((i, qd, result));
+                }
+            }
+
+            // If not a queue token that we are waiting on, then insert into our list of completed tasks.
+            self.completed_tasks.insert(qt, (qd, result));
+        }
+
+        None
+    }
+
+    /// Runs the scheduler for one [TIMER_RESOLUTION] quanta, returning any ready task. Importantly does not modify
+    /// the clock.
+    fn run_next(&mut self, timeout: Duration) -> Option<(QToken, QDesc, OperationResult)> {
+        let iterations: usize = match timeout {
+            timeout if timeout.as_secs() > 0 => TIMER_RESOLUTION,
+            _ => TIMER_FINER_RESOLUTION,
+        };
+        if let Some(boxed_task) = self.scheduler.get_next_completed_task(iterations) {
             // Perform bookkeeping for the completed and removed task.
             trace!("Removing coroutine: {:?}", boxed_task.get_name());
             let qt: QToken = boxed_task.get_id().into();
@@ -298,17 +372,10 @@ impl SharedDemiRuntime {
                 let (qd, result): (QDesc, OperationResult) =
                     expect_some!(operation_task.get_result(), "coroutine not finished");
 
-                // Check whether it matches any of the queue tokens that we are waiting on.
-                for i in 0..qts.len() {
-                    if qts[i] == qt {
-                        return Some((i, qd, result));
-                    }
-                }
-
-                // If not a queue token that we are waiting on, then insert into our list of completed tasks.
-                self.completed_tasks.insert(qt, (qd, result));
+                return Some((qt, qd, result));
             }
         }
+
         None
     }
 
@@ -635,6 +702,7 @@ mod tests {
         QToken,
         SharedDemiRuntime,
     };
+    use ::std::time::Duration;
     use futures::FutureExt;
     use test::Bencher;
 
@@ -671,7 +739,24 @@ mod tests {
     }
 
     #[bench]
-    fn benchmark_run_any(b: &mut Bencher) {
+    fn benchmark_run_any_fine(b: &mut Bencher) {
+        const NUM_TASKS: usize = 1024;
+        let mut qts: [QToken; NUM_TASKS] = [QToken::from(0); NUM_TASKS];
+        let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
+        // Insert a large number of coroutines.
+        for i in 0..NUM_TASKS {
+            // Make the arg big enough that the coroutine doesn't exit.
+            qts[i] = runtime
+                .insert_io_coroutine("dummy coroutine", Box::pin(dummy_coroutine(1000000000).fuse()))
+                .expect("should be able to insert tasks");
+        }
+
+        // Run all of the tasks for one small quanta
+        b.iter(|| runtime.run_any(&qts, Duration::ZERO));
+    }
+
+    #[bench]
+    fn benchmark_run_any_normal(b: &mut Bencher) {
         const NUM_TASKS: usize = 1024;
         let mut qts: [QToken; NUM_TASKS] = [QToken::from(0); NUM_TASKS];
         let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
@@ -684,11 +769,28 @@ mod tests {
         }
 
         // Run all of the tasks for one quanta
-        b.iter(|| runtime.run_any(&qts));
+        b.iter(|| runtime.run_any(&qts, Duration::from_millis(10)));
     }
 
     #[bench]
-    fn benchmark_run_any_background(b: &mut Bencher) {
+    fn benchmark_run_any_long(b: &mut Bencher) {
+        const NUM_TASKS: usize = 1024;
+        let mut qts: [QToken; NUM_TASKS] = [QToken::from(0); NUM_TASKS];
+        let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
+        // Insert a large number of coroutines.
+        for i in 0..NUM_TASKS {
+            // Make the arg big enough that the coroutine doesn't exit.
+            qts[i] = runtime
+                .insert_io_coroutine("dummy coroutine", Box::pin(dummy_coroutine(1000000000).fuse()))
+                .expect("should be able to insert tasks");
+        }
+
+        // Run all of the tasks for one quanta
+        b.iter(|| runtime.run_any(&qts, Duration::from_secs(1)));
+    }
+
+    #[bench]
+    fn benchmark_run_any_background_long(b: &mut Bencher) {
         const NUM_TASKS: usize = 1024;
         let mut qts: [QToken; NUM_TASKS] = [QToken::from(0); NUM_TASKS];
         let mut runtime: SharedDemiRuntime = SharedDemiRuntime::default();
@@ -703,6 +805,6 @@ mod tests {
         }
 
         // Run all of the tasks for one quanta
-        b.iter(|| runtime.run_any(&qts));
+        b.iter(|| runtime.run_any(&qts, Duration::from_secs(1)));
     }
 }
