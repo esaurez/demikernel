@@ -28,13 +28,16 @@ use std::{
 };
 
 #[cfg(target_os = "windows")]
-pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
+pub const AF_INET: windows::Win32::Networking::WinSock::ADDRESS_FAMILY = windows::Win32::Networking::WinSock::AF_INET;
+
+#[cfg(target_os = "windows")]
+pub const AF_INET_VALUE: i32 = AF_INET.0 as i32;
+
+#[cfg(target_os = "linux")]
+pub const AF_INET_VALUE: i32 = libc::AF_INET;
 
 #[cfg(target_os = "windows")]
 pub const SOCK_DGRAM: i32 = windows::Win32::Networking::WinSock::SOCK_DGRAM.0 as i32;
-
-#[cfg(target_os = "linux")]
-pub const AF_INET: i32 = libc::AF_INET;
 
 #[cfg(target_os = "linux")]
 pub const SOCK_DGRAM: i32 = libc::SOCK_DGRAM;
@@ -111,7 +114,7 @@ impl UdpEchoClient {
             for client_id in 0..nclients {
                 let client_local_address = format!("{}:{}", self.local_ip, self.base_port + client_id as u16);
                 let client_socket_address = SocketAddr::from_str(&client_local_address)?;
-                let sockqd: QDesc = self.libos.socket(AF_INET, SOCK_DGRAM, 1)?;
+                let sockqd: QDesc = self.libos.socket(AF_INET_VALUE, SOCK_DGRAM, 1)?;
                 self.clients.insert(
                     sockqd.clone(),
                     (
@@ -217,7 +220,16 @@ impl UdpEchoClient {
         };
 
         // Ensure that scatter-gather array has the requested size.
-        assert!(sga.sga_segs[0].sgaseg_len as usize == size);
+        // If error, free scatter-gather array.
+        if sga.sga_segs[0].sgaseg_len as usize != size {
+            Self::freesga(&mut self.libos, sga);
+            let seglen: usize = sga.sga_segs[0].sgaseg_len as usize;
+            anyhow::bail!(
+                "failed to allocate scatter-gather array: expected size={:?} allocated size={:?}",
+                size,
+                seglen
+            );
+        }
 
         // Fill in scatter-gather array.
         let ptr: *mut u8 = sga.sga_segs[0].sgaseg_buf as *mut u8;
@@ -226,6 +238,14 @@ impl UdpEchoClient {
         slice.fill(value);
 
         Ok(sga)
+    }
+
+    /// Free scatter-gather array and warn on error.
+    fn freesga(libos: &mut LibOS, sga: demi_sgarray_t) {
+        if let Err(e) = libos.sgafree(sga) {
+            println!("ERROR: sgafree() failed (error={:?})", e);
+            println!("WARN: leaking sga");
+        }
     }
 
     /// Handles the completion of a pop operation.
@@ -320,6 +340,9 @@ impl UdpEchoClient {
         let sga: demi_sgarray_t = self.mksga(self.bufsize, fill_char)?;
         let qt: QToken = self.libos.pushto(qd, &sga, self.remote)?;
         self.register_operation(qt);
+
+        // Add the pop that is waiting for the response
+        self.issue_pop(qd, None)?;
         Ok(())
     }
 

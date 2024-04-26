@@ -85,14 +85,24 @@ impl UdpEchoServer {
 
     /// Runs the target TCP echo server.
     pub fn run(&mut self, _log_interval: Option<u64>, niterations: usize) -> Result<()> {
-        // Initialize the server with a pop operation.
-        self.issue_pop(self.sockqd)?;
-
         for iter in 0..niterations {
+            // Initialize the server with a pop operation.
+            self.issue_pop(self.sockqd)?;
             loop {
                 // Wait for any operation to complete.
                 let qr: demi_qresult_t = {
-                    let (index, qr): (usize, demi_qresult_t) = self.libos.wait_any(&self.qts, None)?;
+                    let (index, qr): (usize, demi_qresult_t) = 
+                        match self.libos.wait_any(&self.qts, None) {
+                            Ok((index, qr)) => (index, qr),
+                            Err(e) => {
+                                if e.errno == libc::ETIMEDOUT {
+                                    println!("Wait timed out: {:?}", e);
+                                    return Ok(());
+                                }
+                                println!("ERROR: {:?}", e);
+                                return Err(e.into());
+                            },
+                        };
                     self.unregister_operation(index)?;
                     qr
                 };
@@ -113,6 +123,9 @@ impl UdpEchoServer {
                 }
             }
 
+            // Clean up any pending operations.
+            self.qts.clear();
+
             println!("INFO: iteration {} completed", iter);
         }
         Ok(())
@@ -120,10 +133,9 @@ impl UdpEchoServer {
 
     #[cfg(target_os = "linux")]
     /// Converts a [sockaddr] into a [SocketAddrV4].
-    pub fn sockaddr_to_socketaddrv4(saddr: *const libc::sockaddr) -> Result<SocketAddrV4> {
+    pub fn sockaddr_to_socketaddrv4(saddr: libc::sockaddr) -> Result<SocketAddrV4> {
         // TODO: Change the logic below and rename this function once we support V6 addresses as well.
-        let sin: libc::sockaddr_in =
-            unsafe { *mem::transmute::<*const libc::sockaddr, *const libc::sockaddr_in>(saddr) };
+        let sin: libc::sockaddr_in = unsafe { mem::transmute(saddr) };
         if sin.sin_family != libc::AF_INET as u16 {
             anyhow::bail!("communication domain not supported");
         };
@@ -134,22 +146,25 @@ impl UdpEchoServer {
 
     #[cfg(target_os = "windows")]
     /// Converts a [sockaddr] into a [SocketAddrV4].
-    pub fn sockaddr_to_socketaddrv4(saddr: *const SOCKADDR) -> Result<SocketAddrV4> {
-        // TODO: Change the logic below and rename this function once we support V6 addresses as well.
+    pub fn sockaddr_to_socketaddrv4(saddr: SOCKADDR) -> Result<SocketAddrV4> {
+        // Casting to SOCKADDR_IN
+        let addr_in: SOCKADDR_IN = unsafe { std::mem::transmute(saddr) };
 
-        let sin: SOCKADDR_IN = unsafe { *(saddr as *const SOCKADDR_IN) };
-        if sin.sin_family != AF_INET {
+         if addr_in.sin_family != AF_INET {
             anyhow::bail!("communication domain not supported");
         };
-        let addr: Ipv4Addr = Ipv4Addr::from(u32::from_be(unsafe { sin.sin_addr.S_un.S_addr }));
-        let port: u16 = u16::from_be(sin.sin_port);
-        Ok(SocketAddrV4::new(addr, port))
+        // Extracting IPv4 address and port
+        let ipv4_addr: Ipv4Addr = Ipv4Addr::from(u32::from_be(unsafe {addr_in.sin_addr.S_un.S_addr }));
+        let port: u16 = u16::from_be(addr_in.sin_port);
+
+        // Creating SocketAddrV4
+        Ok(SocketAddrV4::new(ipv4_addr, port))
     }
 
     /// Issues a push operation.
     fn issue_push(&mut self, qr: &demi_qresult_t, sga: &demi_sgarray_t) -> Result<()> {
         let qd: QDesc = qr.qr_qd.into();
-        let saddr: SocketAddr = match Self::sockaddr_to_socketaddrv4(&unsafe { qr.qr_value.sga.sga_addr }) {
+        let saddr: SocketAddr = match Self::sockaddr_to_socketaddrv4(unsafe { qr.qr_value.sga.sga_addr }) {
             Ok(saddr) => SocketAddr::V4(saddr),
             Err(e) => {
                 // If error, free scatter-gather array.
