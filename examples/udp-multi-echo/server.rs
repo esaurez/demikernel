@@ -16,10 +16,13 @@ use demikernel::{
     QDesc,
     QToken,
 };
-use std::net::{
-    Ipv4Addr,
-    SocketAddr,
-    SocketAddrV4,
+use std::{
+    net::{
+        Ipv4Addr,
+        SocketAddr,
+        SocketAddrV4,
+    },
+    str::FromStr,
 };
 
 #[cfg(target_os = "windows")]
@@ -49,6 +52,8 @@ pub const SOCK_DGRAM: i32 = libc::SOCK_DGRAM;
 
 /// A UDP echo server.
 pub struct UdpEchoServer {
+    /// IP of the client
+    remote: String,
     /// Underlying libOS.
     libos: LibOS,
     /// Local socket descriptor.
@@ -63,7 +68,7 @@ pub struct UdpEchoServer {
 
 impl UdpEchoServer {
     /// Instantiates a new TCP echo server.
-    pub fn new(mut libos: LibOS, local: SocketAddr) -> Result<Self> {
+    pub fn new(mut libos: LibOS, local: SocketAddr, remote: String) -> Result<Self> {
         // Create a TCP socket.
         let sockqd: QDesc = libos.socket(AF_INET_VALUE, SOCK_DGRAM, 0)?;
 
@@ -77,6 +82,7 @@ impl UdpEchoServer {
         println!("INFO: listening on {:?}", local);
 
         return Ok(Self {
+            remote,
             libos,
             sockqd,
             qts: Vec::default(),
@@ -91,18 +97,17 @@ impl UdpEchoServer {
             loop {
                 // Wait for any operation to complete.
                 let qr: demi_qresult_t = {
-                    let (index, qr): (usize, demi_qresult_t) = 
-                        match self.libos.wait_any(&self.qts, None) {
-                            Ok((index, qr)) => (index, qr),
-                            Err(e) => {
-                                if e.errno == libc::ETIMEDOUT {
-                                    println!("Wait timed out: {:?}", e);
-                                    return Ok(());
-                                }
-                                println!("ERROR: {:?}", e);
-                                return Err(e.into());
-                            },
-                        };
+                    let (index, qr): (usize, demi_qresult_t) = match self.libos.wait_any(&self.qts, None) {
+                        Ok((index, qr)) => (index, qr),
+                        Err(e) => {
+                            if e.errno == libc::ETIMEDOUT {
+                                println!("Wait timed out: {:?}", e);
+                                return Ok(());
+                            }
+                            println!("ERROR: {:?}", e);
+                            return Err(e.into());
+                        },
+                    };
                     self.unregister_operation(index)?;
                     qr
                 };
@@ -133,66 +138,47 @@ impl UdpEchoServer {
 
     #[cfg(target_os = "linux")]
     /// Converts a [sockaddr] into a [SocketAddrV4].
-    pub fn sockaddr_to_socketaddrv4(saddr: libc::sockaddr) -> Result<SocketAddrV4> {
+    pub fn sockaddr_to_port(saddr: libc::sockaddr) -> Result<u16> {
         // TODO: Change the logic below and rename this function once we support V6 addresses as well.
         let sin: libc::sockaddr_in = unsafe { mem::transmute(saddr) };
         if sin.sin_family != libc::AF_INET as u16 {
             anyhow::bail!("communication domain not supported");
         };
-        let addr: Ipv4Addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        // let addr: Ipv4Addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
         let port: u16 = u16::from_be(sin.sin_port);
-        Ok(SocketAddrV4::new(addr, port))
+        Ok(port)
     }
 
     #[cfg(target_os = "windows")]
     /// Converts a [sockaddr] into a [SocketAddrV4].
-    pub fn sockaddr_to_socketaddrv4(saddr: SOCKADDR) -> Result<SocketAddrV4> {
+    pub fn sockaddr_to_port(saddr: SOCKADDR) -> Result<SocketAddrV4> {
         // Casting to SOCKADDR_IN
         let addr_in: SOCKADDR_IN = unsafe { std::mem::transmute(saddr) };
 
-         if addr_in.sin_family != AF_INET {
+        if addr_in.sin_family != AF_INET {
             anyhow::bail!("communication domain not supported");
         };
         // Extracting IPv4 address and port
-        let ipv4_addr: Ipv4Addr = Ipv4Addr::from(u32::from_be(unsafe {addr_in.sin_addr.S_un.S_addr }));
+        // let ipv4_addr: Ipv4Addr = Ipv4Addr::from(u32::from_be(unsafe {addr_in.sin_addr.S_un.S_addr }));
         let port: u16 = u16::from_be(addr_in.sin_port);
 
         // Creating SocketAddrV4
-        Ok(SocketAddrV4::new(ipv4_addr, port))
+        Ok(port)
     }
 
     /// Issues a push operation.
     fn issue_push(&mut self, qr: &demi_qresult_t, sga: &demi_sgarray_t) -> Result<()> {
         let qd: QDesc = qr.qr_qd.into();
-        let saddr: SocketAddr = match Self::sockaddr_to_socketaddrv4(unsafe { qr.qr_value.sga.sga_addr }) {
-            Ok(saddr) => SocketAddr::V4(saddr),
-            Err(e) => {
-                // If error, free scatter-gather array.
-                if let Err(e) = self.libos.sgafree(*sga) {
-                    println!("ERROR: sgafree( failed (error={:?})", e);
-                    println!("WARN: leaking sga");
-                };
-                anyhow::bail!("could not parse sockaddr: {}", e)
-            },
-        };
+        let port = Self::sockaddr_to_port(unsafe { qr.qr_value.sga.sga_addr })?;
+        let saddr: SocketAddr = SocketAddr::from_str(&format!("{}:{}", self.remote, port))?;
 
         // Push packet back.
         let qt: QToken = match self.libos.pushto(qd, sga, saddr) {
             Ok(qt) => qt,
             Err(e) => {
-                // If error, free scatter-gather array.
-                if let Err(e) = self.libos.sgafree(*sga) {
-                    println!("ERROR: sgafree() failed (error={:?})", e);
-                    println!("WARN: leaking sga");
-                };
                 anyhow::bail!("failed to push data to socket: {:?}", e)
             },
         };
-
-        if let Err(e) = self.libos.sgafree(*sga) {
-            println!("ERROR: sgafree() failed (error={:?})", e);
-            println!("WARN: leaking sga");
-        }
 
         self.register_operation(qt);
         Ok(())
@@ -211,25 +197,10 @@ impl UdpEchoServer {
         let qt: QToken = qr.qr_qt.into();
         let errno: i64 = qr.qr_ret;
 
-        // Check if client has reset the connection.
-        if errno == libc::ECONNRESET as i64 || errno == libc::ECANCELED as i64 || errno == libc::EBADF as i64 {
-            if errno == libc::ECONNRESET as i64 {
-                println!("INFO: client reset connection (qd={:?})", qd);
-            }
-            if errno == libc::EBADF as i64 {
-                println!("INFO: client terminated connection (qd={:?})", qd);
-            } else {
-                println!(
-                    "INFO: operation cancelled, resetting connection (qd={:?}, qt={:?})",
-                    qd, qt
-                );
-            }
-        } else {
-            println!(
-                "WARN: operation failed, ignoring (qd={:?}, qt={:?}, errno={:?})",
-                qd, qt, errno
-            );
-        }
+        println!(
+            "WARN: operation failed, ignoring (qd={:?}, qt={:?}, errno={:?})",
+            qd, qt, errno
+        );
 
         Ok(())
     }
@@ -254,9 +225,10 @@ impl UdpEchoServer {
     fn handle_pop(&mut self, qr: &demi_qresult_t) -> Result<bool> {
         let qd: QDesc = qr.qr_qd.into();
         let sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
+        let len: u32 = sga.sga_segs[0].sgaseg_len;
 
         // Check if we received any data.
-        if sga.sga_segs[0].sgaseg_len == 1 {
+        if len == 1 {
             // Chose message size equal 1 to mean end of iteration for the evaluation
             return Ok(true);
         } else {

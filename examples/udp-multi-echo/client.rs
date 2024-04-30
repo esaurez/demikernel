@@ -205,7 +205,19 @@ impl UdpEchoClient {
     fn close_socket(&mut self, qd: QDesc) -> Result<()> {
         // Send a message with size 1 to signal the server to close the connection
         let sga: demi_sgarray_t = self.mksga(1, 0)?;
-        self.libos.pushto(qd, &sga, self.remote)?;
+        let qt: QToken = match self.libos.pushto(qd, &sga, self.remote) {
+            Ok(qt) => qt,
+            Err(e) => anyhow::bail!("failed to send close message: {:?}", e),
+        };
+        match self.libos.wait(qt, None) {
+            Ok(qr) if qr.qr_opcode == demi_opcode_t::DEMI_OPC_PUSH => (),
+            Ok(_) => anyhow::bail!("unexpected result"),
+            Err(e) => anyhow::bail!("operation failed: {:?}", e),
+        };
+        match self.libos.sgafree(sga) {
+            Ok(_) => {},
+            Err(e) => anyhow::bail!("failed to release scatter-gather array: {:?}", e),
+        }
         // Close the socket
         self.libos.close(qd)?;
         Ok(())
@@ -295,7 +307,7 @@ impl UdpEchoClient {
         let qd: QDesc = qr.qr_qd.into();
         self.npushed += 1;
 
-        // Pop another packet.
+        // Pop another packet
         self.issue_pop(qd, None)?;
         Ok(())
     }
@@ -340,9 +352,6 @@ impl UdpEchoClient {
         let sga: demi_sgarray_t = self.mksga(self.bufsize, fill_char)?;
         let qt: QToken = self.libos.pushto(qd, &sga, self.remote)?;
         self.register_operation(qt);
-
-        // Add the pop that is waiting for the response
-        self.issue_pop(qd, None)?;
         Ok(())
     }
 

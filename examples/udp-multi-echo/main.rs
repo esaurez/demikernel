@@ -63,11 +63,11 @@ pub struct ProgramArguments {
     log_interval: Option<u64>,
     /// Peer type.
     peer_type: String,
+    // Client IP address.
+    client_ip: String,
     /// Only used for the client.
-    // Local IP address.
-    local_ip: Option<String>,
     // Local base port.
-    local_base_port: Option<u16>,
+    client_base_port: Option<u16>,
 }
 
 /// Associate functions for Program Arguments
@@ -83,7 +83,7 @@ impl ProgramArguments {
                     .value_parser(clap::value_parser!(String))
                     .required(true)
                     .value_name("ADDRESS:PORT")
-                    .help("Sets socket address"),
+                    .help("Sets socket address for server"),
             )
             .arg(
                 Arg::new("peer")
@@ -135,22 +135,22 @@ impl ProgramArguments {
                     .help("Enables logging"),
             )
             .arg(
-                Arg::new("local_ip")
-                    .long("local-ip")
+                Arg::new("client_ip")
+                    .long("client-ip")
                     .value_parser(clap::value_parser!(String))
                     .required(false)
-                    .value_name("IP")
-                    .help("Sets local IP address"),
+                    .value_name("CLIENT_IP")
+                    .help("Sets client IP address"),
             )
             .arg(
-                Arg::new("local_base_port")
-                    .long("local-base-port")
+                Arg::new("client_base_port")
+                    .long("client-base-port")
                     .value_parser(clap::value_parser!(u16))
                     .required(false)
-                    .value_name("LOCAL_BASE_PORT")
+                    .value_name("CLIENT_BASE_PORT")
                     .help(
-                        "Sets the base port used for the local address, all local udp ports will be in the range \
-                         [LOCAL_BASE_PORT, LOCAL_BASE_PORT + nclients)",
+                        "Sets the base port used for the client address, all local udp ports will be in the range \
+                         [CLIENT_BASE_PORT, CLIENT_BASE_PORT + nclients), only used by the client",
                     ),
             )
             .get_matches();
@@ -159,6 +159,12 @@ impl ProgramArguments {
         let addr: SocketAddr = {
             let addr: &String = matches.get_one::<String>("addr").expect("missing address");
             SocketAddr::from_str(addr)?
+        };
+        
+        // Local ip
+        let client_ip: String = {
+            let client_ip: &String = matches.get_one::<String>("client_ip").expect("missing client IP address");
+            client_ip.to_string()
         };
 
         // Default arguments.
@@ -170,8 +176,8 @@ impl ProgramArguments {
             niterations: None,
             log_interval: None,
             peer_type: "server".to_string(),
-            local_ip: None,
-            local_base_port: None,
+            client_ip: client_ip,
+            client_base_port: None,
         };
 
         // Buffer size.
@@ -220,15 +226,10 @@ impl ProgramArguments {
             }
         }
 
-        // Local ip
-        if let Some(local_ip) = matches.get_one::<String>("local_ip") {
-            let ref mut this = args;
-            this.local_ip = Some(local_ip.to_string());
-        }
 
         // Local base port
-        if let Some(local_base_port) = matches.get_one::<u16>("local_base_port") {
-            args.local_base_port = Some(*local_base_port);
+        if let Some(client_base_port) = matches.get_one::<u16>("client_base_port") {
+            args.client_base_port = Some(*client_base_port);
         }
 
         Ok(args)
@@ -255,7 +256,7 @@ fn main() -> Result<()> {
 
     match args.peer_type.as_str() {
         "server" => {
-            let mut server: UdpEchoServer = UdpEchoServer::new(libos, args.addr)?;
+            let mut server: UdpEchoServer = UdpEchoServer::new(libos, args.addr, args.client_ip)?;
             let niterations: usize = args
                 .niterations
                 .ok_or(anyhow::anyhow!("missing number of iterations"))?;
@@ -266,8 +267,8 @@ fn main() -> Result<()> {
                 libos,
                 args.bufsize.ok_or(anyhow::anyhow!("missing buffer size"))?,
                 args.addr,
-                args.local_ip.unwrap(),
-                args.local_base_port.unwrap(),
+                args.client_ip.unwrap(),
+                args.client_base_port.unwrap(),
             )?;
             let nclients: usize = args.nclients.ok_or(anyhow::anyhow!("missing number of clients"))?;
             let niterations: usize = args
