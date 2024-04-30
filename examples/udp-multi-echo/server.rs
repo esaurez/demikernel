@@ -17,11 +17,7 @@ use demikernel::{
     QToken,
 };
 use std::{
-    net::{
-        Ipv4Addr,
-        SocketAddr,
-        SocketAddrV4,
-    },
+    net::SocketAddr, 
     str::FromStr,
 };
 
