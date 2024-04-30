@@ -137,7 +137,7 @@ impl UdpEchoServer {
     }
 
     #[cfg(target_os = "linux")]
-    /// Converts a [sockaddr] into a [SocketAddrV4].
+    /// Converts a [sockaddr] into a port number.
     pub fn sockaddr_to_port(saddr: libc::sockaddr) -> Result<u16> {
         // TODO: Change the logic below and rename this function once we support V6 addresses as well.
         let sin: libc::sockaddr_in = unsafe { mem::transmute(saddr) };
@@ -150,8 +150,8 @@ impl UdpEchoServer {
     }
 
     #[cfg(target_os = "windows")]
-    /// Converts a [sockaddr] into a [SocketAddrV4].
-    pub fn sockaddr_to_port(saddr: SOCKADDR) -> Result<SocketAddrV4> {
+    /// Converts a [sockaddr] into a port number.
+    pub fn sockaddr_to_port(saddr: SOCKADDR) -> Result<u16> {
         // Casting to SOCKADDR_IN
         let addr_in: SOCKADDR_IN = unsafe { std::mem::transmute(saddr) };
 
