@@ -267,7 +267,7 @@ fn main() -> Result<()> {
                 libos,
                 args.bufsize.ok_or(anyhow::anyhow!("missing buffer size"))?,
                 args.addr,
-                args.client_ip.unwrap(),
+                args.client_ip,
                 args.client_base_port.unwrap(),
             )?;
             let nclients: usize = args.nclients.ok_or(anyhow::anyhow!("missing number of clients"))?;
