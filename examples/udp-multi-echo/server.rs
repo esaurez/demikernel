@@ -136,7 +136,7 @@ impl UdpEchoServer {
     /// Converts a [sockaddr] into a port number.
     pub fn sockaddr_to_port(saddr: libc::sockaddr) -> Result<u16> {
         // TODO: Change the logic below and rename this function once we support V6 addresses as well.
-        let sin: libc::sockaddr_in = unsafe { mem::transmute(saddr) };
+        let sin: libc::sockaddr_in = unsafe { std::mem::transmute(saddr) };
         if sin.sin_family != libc::AF_INET as u16 {
             anyhow::bail!("communication domain not supported");
         };
