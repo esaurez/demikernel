@@ -52,7 +52,7 @@ dpdk-rs = { path = "dpdk-rs", optional = true }
 
 # Virtio dependencies
 lazy_static = "1.4.0"
-[target.'cfg(linux)'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 argh = "0.1.9"
 env_logger = "0.10.0"
 epoll = "4.3.1"

@@ -1,9 +1,6 @@
 // Copyright 2023 Microsoft Corporation. All Rights Reserved.
 
-use libc::{
-    self,
-    EFD_NONBLOCK,
-};
+use libc::EFD_NONBLOCK;
 use log::*;
 use std::{
     collections::HashMap,
@@ -22,7 +19,6 @@ use std::{
         RwLock,
         RwLockWriteGuard,
     },
-    vec::Vec,
 };
 use vhost::vhost_user::{
     message::*,

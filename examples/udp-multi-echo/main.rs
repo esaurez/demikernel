@@ -160,10 +160,12 @@ impl ProgramArguments {
             let addr: &String = matches.get_one::<String>("addr").expect("missing address");
             SocketAddr::from_str(addr)?
         };
-        
+
         // Local ip
         let client_ip: String = {
-            let client_ip: &String = matches.get_one::<String>("client_ip").expect("missing client IP address");
+            let client_ip: &String = matches
+                .get_one::<String>("client_ip")
+                .expect("missing client IP address");
             client_ip.to_string()
         };
 
@@ -225,7 +227,6 @@ impl ProgramArguments {
                 this.peer_type = peer_type;
             }
         }
-
 
         // Local base port
         if let Some(client_base_port) = matches.get_one::<u16>("client_base_port") {

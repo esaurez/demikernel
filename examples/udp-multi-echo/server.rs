@@ -17,7 +17,7 @@ use demikernel::{
     QToken,
 };
 use std::{
-    net::SocketAddr, 
+    net::SocketAddr,
     str::FromStr,
 };
 
