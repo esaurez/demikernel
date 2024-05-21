@@ -7,13 +7,20 @@
 
 use crate::{
     catmem::SharedCatmemLibOS,
+    demikernel::config::Config,
     expect_ok,
     expect_some,
     runtime::{
         conditional_yield_with_timeout,
         fail::Fail,
         memory::DemiBuffer,
-        network::unwrap_socketaddr,
+        network::{
+            socket::option::{
+                SocketOption,
+                TcpSocketOptions,
+            },
+            unwrap_socketaddr,
+        },
         queue::QDesc,
         OperationResult,
         SharedObject,
@@ -68,6 +75,8 @@ pub struct MemorySocket {
     pending_request_ids: HashSet<RequestId>,
     /// Random number generator for request ids.
     rng: SmallRng,
+    /// SO_LINGER option, which dictates how long to wait for the connection to close.
+    options: TcpSocketOptions,
 }
 
 pub struct SharedMemorySocket(SharedObject<MemorySocket>);
@@ -82,8 +91,8 @@ pub struct RequestId(u64);
 
 impl SharedMemorySocket {
     /// Creates a new socket that is not bound to an address.
-    pub fn new() -> Self {
-        Self(SharedObject::new(MemorySocket {
+    pub fn new(config: &Config) -> Result<Self, Fail> {
+        Ok(Self(SharedObject::new(MemorySocket {
             catmem_qd: None,
             local: None,
             remote: None,
@@ -93,12 +102,18 @@ impl SharedMemorySocket {
             rng: SmallRng::seed_from_u64(REQUEST_ID_SEED),
             #[cfg(not(debug_assertions))]
             rng: SmallRng::from_entropy(),
-        }))
+            options: TcpSocketOptions::new(config)?,
+        })))
     }
 
     /// Allocates a new socket that is bound to [local].
-    fn alloc(catmem_qd: QDesc, local: Option<SocketAddrV4>, remote: Option<SocketAddrV4>) -> Self {
-        Self(SharedObject::new(MemorySocket {
+    fn alloc(
+        catmem_qd: QDesc,
+        local: Option<SocketAddrV4>,
+        remote: Option<SocketAddrV4>,
+        options: &TcpSocketOptions,
+    ) -> Result<Self, Fail> {
+        Ok(Self(SharedObject::new(MemorySocket {
             catmem_qd: Some(catmem_qd),
             local,
             remote,
@@ -108,7 +123,41 @@ impl SharedMemorySocket {
             rng: SmallRng::seed_from_u64(REQUEST_ID_SEED),
             #[cfg(not(debug_assertions))]
             rng: SmallRng::from_entropy(),
-        }))
+            options: options.clone(),
+        })))
+    }
+
+    /// Set an SO_* option on the socket.
+    pub fn set_socket_option(&mut self, option: SocketOption) -> Result<(), Fail> {
+        match option {
+            SocketOption::Linger(linger) => self.options.set_linger(linger),
+            SocketOption::KeepAlive(keepalive) => self.options.set_keepalive(keepalive),
+            SocketOption::NoDelay(nodelay) => self.options.set_nodelay(nodelay),
+        }
+        Ok(())
+    }
+
+    /// Gets an SO_* option on the socket. The option should be passed in as [option] and the value is returned in
+    /// [option].
+    pub fn get_socket_option(&mut self, option: SocketOption) -> Result<SocketOption, Fail> {
+        match option {
+            SocketOption::Linger(_) => Ok(SocketOption::Linger(self.options.get_linger())),
+            SocketOption::KeepAlive(_) => Ok(SocketOption::KeepAlive(self.options.get_keepalive())),
+            SocketOption::NoDelay(_) => Ok(SocketOption::NoDelay(self.options.get_nodelay())),
+        }
+    }
+
+    /// Gets address of peer connected to socket.
+    pub fn getpeername(&mut self) -> Result<SocketAddrV4, Fail> {
+        match self.remote {
+            Some(addr) => Ok(addr),
+            None => {
+                let cause: String = format!("socket is not connected");
+                error!("getpeername(): {:?}", &cause);
+                Err(Fail::new(libc::ENOTCONN, &cause))
+            }
+
+        }
     }
 
     /// Binds the target socket to `local` address.
@@ -166,7 +215,7 @@ impl SharedMemorySocket {
         };
 
         let new_addr: SocketAddrV4 = SocketAddrV4::new(ipv4, new_port);
-        let new_socket: Self = Self::alloc(new_qd, Some(new_addr), None);
+        let new_socket: Self = Self::alloc(new_qd, Some(new_addr), None, &self.options)?;
 
         // Check that the remote has retrieved the port number and responded with a valid request id.
         match pop_request_id(catmem.clone(), new_qd).await {
@@ -230,11 +279,23 @@ impl SharedMemorySocket {
     /// Closes `socket`.
     pub async fn close(&mut self, catmem: SharedCatmemLibOS) -> Result<(), Fail> {
         if let Some(qd) = self.catmem_qd {
-            match catmem.close_coroutine(qd).await {
+            let result = if let Some(linger) = self.options.get_linger() {
+                match conditional_yield_with_timeout(catmem.close_coroutine(qd), linger).await {
+                    Err(e) if e.errno == libc::ETIMEDOUT => {
+                        // This case is actually ok because we have waited out the linger time out.
+                        return Ok(());
+                    },
+                    Err(e) => return Err(e),
+                    Ok(result) => result,
+                }
+            } else {
+                catmem.close_coroutine(qd).await
+            };
+            match result {
                 (_, OperationResult::Close) => (),
                 (_, OperationResult::Failed(e)) => return Err(e),
                 _ => panic!("Should not return anything other than close or fail"),
-            }
+            };
         };
         Ok(())
     }

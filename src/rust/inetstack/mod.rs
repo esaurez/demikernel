@@ -26,6 +26,7 @@ use crate::{
             MemoryRuntime,
         },
         network::{
+            socket::option::SocketOption,
             transport::NetworkTransport,
             types::MacAddress,
             unwrap_socketaddr,
@@ -98,6 +99,9 @@ pub struct InetStack<N: NetworkRuntime> {
     runtime: SharedDemiRuntime,
     network: N,
     local_link_addr: MacAddress,
+    // Keeping this here for now in case we want to use it.
+    #[allow(unused)]
+    local_ipv4_addr: Ipv4Addr,
 }
 
 #[derive(Clone)]
@@ -109,7 +113,7 @@ pub struct SharedInetStack<N: NetworkRuntime>(SharedObject<InetStack<N>>);
 
 impl<N: NetworkRuntime> SharedInetStack<N> {
     pub fn new(config: Config, runtime: SharedDemiRuntime, network: N) -> Result<Self, Fail> {
-        SharedInetStack::<N>::new_test(runtime, network, config.local_link_addr(), config.local_ipv4_addr())
+        SharedInetStack::<N>::new_test(runtime, network, config.local_link_addr()?, config.local_ipv4_addr()?)
     }
 
     pub fn new_test(
@@ -141,7 +145,8 @@ impl<N: NetworkRuntime> SharedInetStack<N> {
             ipv4,
             runtime: runtime.clone(),
             network,
-            local_link_addr: local_link_addr,
+            local_link_addr,
+            local_ipv4_addr,
         }));
         runtime.insert_background_coroutine("inetstack::poll_recv", Box::pin(me.clone().poll().fuse()))?;
         Ok(me)
@@ -279,6 +284,49 @@ impl<N: NetworkRuntime> NetworkTransport for SharedInetStack<N> {
             Type::STREAM => Ok(Socket::Tcp(self.ipv4.tcp.socket()?)),
             Type::DGRAM => Ok(Socket::Udp(self.ipv4.udp.socket()?)),
             _ => Err(Fail::new(libc::ENOTSUP, "socket type not supported")),
+        }
+    }
+
+    /// Set an SO_* option on the socket.
+    fn set_socket_option(&mut self, sd: &mut Self::SocketDescriptor, option: SocketOption) -> Result<(), Fail> {
+        match sd {
+            Socket::Tcp(socket) => self.ipv4.tcp.set_socket_option(socket, option),
+            Socket::Udp(_) => {
+                let cause: String = format!("Socket options are not supported on UDP sockets");
+                error!("get_socket_option(): {}", cause);
+                Err(Fail::new(libc::ENOTSUP, &cause))
+            },
+        }
+    }
+
+    /// Gets an SO_* option on the socket. The option should be passed in as [option] and the value is returned in
+    /// [option].
+    fn get_socket_option(
+        &mut self,
+        sd: &mut Self::SocketDescriptor,
+        option: SocketOption,
+    ) -> Result<SocketOption, Fail> {
+        match sd {
+            Socket::Tcp(socket) => self.ipv4.tcp.get_socket_option(socket, option),
+            Socket::Udp(_) => {
+                let cause: String = format!("Socket options are not supported on UDP sockets");
+                error!("get_socket_option(): {}", cause);
+                Err(Fail::new(libc::ENOTSUP, &cause))
+            },
+        }
+    }
+
+    fn getpeername(
+        &mut self,
+        sd: &mut Self::SocketDescriptor,
+    ) -> Result<SocketAddrV4, Fail> {
+        match sd {
+            Socket::Tcp(socket) => self.ipv4.tcp.getpeername(socket),
+            Socket::Udp(_) => {
+                let cause: String = format!("Getting peer address is not supported on UDP sockets");
+                error!("getpeername(): {}", cause);
+                Err(Fail::new(libc::ENOTSUP, &cause))
+            }
         }
     }
 

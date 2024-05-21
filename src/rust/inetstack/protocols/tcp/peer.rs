@@ -21,7 +21,10 @@ use crate::{
         memory::DemiBuffer,
         network::{
             config::TcpConfig,
-            socket::SocketId,
+            socket::{
+                option::SocketOption,
+                SocketId,
+            },
             types::MacAddress,
             NetworkRuntime,
         },
@@ -113,6 +116,28 @@ impl<N: NetworkRuntime> SharedTcpPeer<N> {
         ))
     }
 
+    /// Sets an option on a TCP socket.
+    pub fn set_socket_option(&mut self, socket: &mut SharedTcpSocket<N>, option: SocketOption) -> Result<(), Fail> {
+        socket.set_socket_option(option)
+    }
+
+    /// Sets an option on a TCP socket.
+    pub fn get_socket_option(
+        &mut self,
+        socket: &mut SharedTcpSocket<N>,
+        option: SocketOption,
+    ) -> Result<SocketOption, Fail> {
+        socket.get_socket_option(option)
+    }
+
+    /// Gets a peer address on a TCP socket.
+    pub fn getpeername(
+        &mut self,
+        socket: &mut SharedTcpSocket<N>,
+    ) -> Result<SocketAddrV4, Fail> {
+        socket.getpeername()
+    }
+
     /// Binds a socket to a local address supplied by [local].
     pub fn bind(&mut self, socket: &mut SharedTcpSocket<N>, local: SocketAddrV4) -> Result<(), Fail> {
         // All other checks should have been done already.
@@ -139,9 +164,12 @@ impl<N: NetworkRuntime> SharedTcpPeer<N> {
         // Wait for accept to complete.
         match socket.accept().await {
             Ok(socket) => {
-                self.addresses.insert(SocketId::Active(socket.local().unwrap(), socket.remote().unwrap()), socket.clone());
+                self.addresses.insert(
+                    SocketId::Active(socket.local().unwrap(), socket.remote().unwrap()),
+                    socket.clone(),
+                );
                 Ok(socket)
-            }
+            },
             Err(e) => Err(e),
         }
     }

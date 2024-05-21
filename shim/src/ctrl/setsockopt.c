@@ -8,7 +8,6 @@
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 
-
 /**
  * @brief Sets socket options.
  *
@@ -33,53 +32,31 @@ int __setsockopt(int sockfd, int level, int optname, const void *optval, socklen
 
     TRACE("sockfd=%d, level=%d, optname=%d, optval=%p, optlen=%d", sockfd, level, optname, optval, optlen);
 
-    if (level == SOL_SOCKET && optname == SO_KEEPALIVE)
+    // Issue warnings for common options that are not supported.
+    if (level == SOL_SOCKET && optname == SO_REUSEADDR)
     {
-        // Ignore.
-        INFO("setting %s", "SO_KEEPALIVE");
-    }
-    else if (level == SOL_SOCKET && optname == SO_REUSEADDR)
-    {
-        // Ignore.
-        INFO("setting %s", "SO_REUSEADDR");
-    }
-    else if (level == SOL_SOCKET && optname == SO_LINGER)
-    {
-        // Ignore.
-        INFO("setting %s", "SO_LINGER");
-    }
-    else if (level == IPPROTO_TCP && optname == TCP_NODELAY)
-    {
-        // Ignore.
-        INFO("setting %s", "TCP_NODELAY");
+        WARN("%s is not supported", "SO_REUSEADDR");
     }
     else if (level == IPPROTO_TCP && optname == TCP_KEEPIDLE)
     {
-        // Ignore.
-        INFO("setting %s", "TCP_KEEPIDLE");
+        WARN("%s is not supported", "TCP_KEEPIDLE");
     }
     else if (level == IPPROTO_TCP && optname == TCP_KEEPINTVL)
     {
-        // Ignore.
-        INFO("setting %s", "TCP_KEEPINTLVL");
+        // TODO: Unify this support with Windows SO_KEEPALIVE once we support TCP-level options.
+        // FIXME: https://github.com/microsoft/demikernel/issues/1282
+        WARN("%s is not supported", "TCP_KEEPINTLVL");
     }
     else if (level == IPPROTO_TCP && optname == TCP_KEEPCNT)
     {
-        // Ignore.
-        INFO("setting %s", "TCP_KEEPCNT");
+        // TODO: Unify this support with Windows SO_KEEPALIVE once we support TCP-level options.
+        // FIXME: https://github.com/microsoft/demikernel/issues/1282
+        WARN("%s is not supported", "TCP_KEEPCNT");
     }
     else if (level == IPPROTO_TCP && optname == TCP_ULP)
     {
-        // Ignore.
-        INFO("setting %s", "TCP_ULP");
-    }
-    else
-    {
-        // Option not supported.
-        ERROR("option not supported");
-        errno = ENOTSUP;
-        return -1;
+        WARN("%s is not supported", "TCP_ULP");
     }
 
-    return 0;
+    return (demi_setsockopt(sockfd, level, optname, optval, optlen));
 }

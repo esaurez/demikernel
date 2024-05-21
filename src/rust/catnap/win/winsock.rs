@@ -6,7 +6,12 @@
 //==============================================================================
 
 use std::{
+    net::{
+        Ipv4Addr,
+        SocketAddrV4,
+    },
     collections::HashMap,
+    mem,
     mem::MaybeUninit,
     rc::{
         Rc,
@@ -22,9 +27,11 @@ use crate::{
             Socket,
             SocketOpState,
         },
-        WinConfig,
     },
-    runtime::fail::Fail,
+    runtime::{
+        fail::Fail,
+        network::socket::option::TcpSocketOptions,
+    },
 };
 use windows::{
     core::{
@@ -35,6 +42,7 @@ use windows::{
         closesocket,
         getsockopt,
         setsockopt,
+        getpeername,
         WSACleanup,
         WSAIoctl,
         WSASocketW,
@@ -48,6 +56,9 @@ use windows::{
         SIO_GET_EXTENSION_FUNCTION_POINTER,
         SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER,
         SOCKET,
+        SOCKADDR,
+        SOCKADDR_IN,
+        IN_ADDR_0_0,
         SOL_SOCKET,
         SO_PROTOCOL_INFOW,
         WSADATA,
@@ -292,6 +303,25 @@ impl WinsockRuntime {
         Self::do_getsockopt(s, level, optname)
     }
 
+    /// Gets ip and port from SOCKADDR_IN and converts to SocketAddrV4
+    pub fn getpeername(s: SOCKET) -> Result<SocketAddrV4, Fail> {
+        let mut sockaddr_in: SOCKADDR_IN = SOCKADDR_IN::default();
+        let sockaddr_ptr: &mut SOCKADDR =  &mut unsafe { mem::transmute::<SOCKADDR_IN, SOCKADDR>(sockaddr_in) };
+        let mut namelen: i32 = std::mem::size_of::<SOCKADDR>() as i32;
+
+        if unsafe { getpeername(s, sockaddr_ptr, &mut namelen) } == 0 {
+            sockaddr_in = unsafe { mem::transmute::<SOCKADDR, SOCKADDR_IN>(*sockaddr_ptr) };
+            let port: u16 = sockaddr_in.sin_port;
+            let addr: IN_ADDR_0_0 = unsafe { sockaddr_in.sin_addr.S_un.S_un_b };
+            let addrv4: SocketAddrV4 = SocketAddrV4::new(
+                    Ipv4Addr::new(addr.s_b1, addr.s_b2, addr.s_b3, addr.s_b4),
+                    port);
+            Ok(addrv4)
+        } else {
+            Err(expect_last_wsa_error())
+        }
+    }
+
     /// Get or initialize a new `SocketExtensions` instance for a  socket. Extensions are stored by socket provider,
     /// which may be shared by multiple sockets.
     fn get_or_init_extensions(&mut self, s: SOCKET) -> Result<Rc<SocketExtensions>, Fail> {
@@ -332,7 +362,7 @@ impl WinsockRuntime {
         domain: libc::c_int,
         typ: libc::c_int,
         protocol: libc::c_int,
-        config: &WinConfig,
+        options: &TcpSocketOptions,
         iocp: &IoCompletionPort<SocketOpState>,
     ) -> Result<Socket, Fail> {
         // Safety: SOCKET is a loose handle; it must be closed with `closesocket` to clean up resources. Socket struct
@@ -340,7 +370,7 @@ impl WinsockRuntime {
         let s: SOCKET = unsafe { Self::raw_socket(domain, typ, protocol, None, WSA_FLAG_OVERLAPPED) }?;
 
         self.get_or_init_extensions(s)
-            .and_then(|extensions: Rc<SocketExtensions>| Socket::new(s, protocol, config, extensions, iocp))
+            .and_then(|extensions: Rc<SocketExtensions>| Socket::new(s, protocol, options, extensions, iocp))
             .or_else(|err: Fail| {
                 unsafe { closesocket(s) };
                 Err(err)

@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//==============================================================================
+//======================================================================================================================
 // Imports
-//==============================================================================
+//======================================================================================================================
 
-use super::runtime::SharedDummyRuntime;
+use crate::common::runtime::SharedDummyRuntime;
 use ::demikernel::{
     demi_sgarray_t,
     demikernel::libos::network::libos::SharedNetworkLibOS,
@@ -48,9 +48,9 @@ use std::{
     },
 };
 
-//==============================================================================
+//======================================================================================================================
 // Structures
-//==============================================================================
+//======================================================================================================================
 
 /// A default amount of time to wait on an operation to complete. This was chosen arbitrarily to be quite small to make
 /// timeouts fast.
@@ -58,9 +58,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1);
 
 pub struct DummyLibOS(SharedNetworkLibOS<SharedInetStack<SharedDummyRuntime>>);
 
-//==============================================================================
-// Associated Functons
-//==============================================================================
+//======================================================================================================================
+// Associate Functions
+//======================================================================================================================
 
 impl DummyLibOS {
     /// Initializes the libOS.
@@ -77,7 +77,6 @@ impl DummyLibOS {
             Some(Duration::from_secs(1)),
             Some(2),
             Some(arp.clone()),
-            Some(false),
         );
         let udp_config: UdpConfig = UdpConfig::default();
         let tcp_config: TcpConfig = TcpConfig::default();
@@ -86,7 +85,7 @@ impl DummyLibOS {
         logging::initialize();
         let transport = SharedInetStack::new_test(runtime.clone(), network, link_addr, ipv4_addr)?;
         Ok(Self(SharedNetworkLibOS::<SharedInetStack<SharedDummyRuntime>>::new(
-            runtime, transport,
+            ipv4_addr, runtime, transport,
         )))
     }
 

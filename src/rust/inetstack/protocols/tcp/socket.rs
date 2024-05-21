@@ -27,7 +27,13 @@ use crate::{
         memory::DemiBuffer,
         network::{
             config::TcpConfig,
-            socket::SocketId,
+            socket::{
+                option::{
+                    SocketOption,
+                    TcpSocketOptions,
+                },
+                SocketId,
+            },
             NetworkRuntime,
         },
         QDesc,
@@ -71,6 +77,7 @@ pub struct TcpSocket<N: NetworkRuntime> {
     network: N,
     local_link_addr: MacAddress,
     tcp_config: TcpConfig,
+    tcp_options: TcpSocketOptions,
     arp: SharedArpPeer<N>,
     dead_socket_tx: mpsc::UnboundedSender<QDesc>,
 }
@@ -98,6 +105,7 @@ impl<N: NetworkRuntime> SharedTcpSocket<N> {
             network,
             local_link_addr,
             tcp_config,
+            tcp_options: TcpSocketOptions::default(),
             arp,
             dead_socket_tx,
         }))
@@ -120,9 +128,45 @@ impl<N: NetworkRuntime> SharedTcpSocket<N> {
             network,
             local_link_addr,
             tcp_config,
+            tcp_options: TcpSocketOptions::default(),
             arp,
             dead_socket_tx,
         }))
+    }
+
+    /// Set an SO_* option on the socket.
+    pub fn set_socket_option(&mut self, option: SocketOption) -> Result<(), Fail> {
+        match option {
+            SocketOption::Linger(linger) => self.tcp_options.set_linger(linger),
+            SocketOption::KeepAlive(keep_alive) => self.tcp_options.set_keepalive(keep_alive),
+            SocketOption::NoDelay(no_delay) => self.tcp_options.set_nodelay(no_delay),
+        }
+        Ok(())
+    }
+
+    /// Gets an SO_* option on the socket. The option should be passed in as [option] and the value is returned in
+    /// [option].
+    pub fn get_socket_option(&mut self, option: SocketOption) -> Result<SocketOption, Fail> {
+        match option {
+            SocketOption::Linger(_) => Ok(SocketOption::Linger(self.tcp_options.get_linger())),
+            SocketOption::KeepAlive(_) => Ok(SocketOption::KeepAlive(self.tcp_options.get_keepalive())),
+            SocketOption::NoDelay(_) => Ok(SocketOption::NoDelay(self.tcp_options.get_nodelay())),
+        }
+    }
+
+    /// Gets the peer address of the socket.
+    pub fn getpeername(&mut self) -> Result<SocketAddrV4, Fail> {
+        match self.state {
+            SocketState::Established(ref mut socket) => {
+                let (_, remote_endpoint): (SocketAddrV4, SocketAddrV4) = socket.endpoints();
+                return Ok(remote_endpoint);
+            },
+            _ => {
+                let cause: String = format!("socket is not in established state");
+                error!("getpeername(): {}", &cause);
+                Err(Fail::new(libc::ENOTCONN, &cause))
+            },
+        }
     }
 
     /// Binds the target queue to `local` address.

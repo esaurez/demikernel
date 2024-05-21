@@ -42,6 +42,7 @@ use crate::{
         fail::Fail,
         limits,
         logging,
+        network::socket::option::SocketOption,
         types::{
             demi_qresult_t,
             demi_sgarray_t,
@@ -54,7 +55,10 @@ use crate::{
 };
 use ::std::{
     env,
-    net::SocketAddr,
+    net::{
+        SocketAddr,
+        SocketAddrV4,
+    },
     time::Duration,
 };
 
@@ -105,7 +109,7 @@ impl LibOS {
                 ))
             },
         };
-        let config: Config = Config::new(config_path);
+        let config: Config = Config::new(config_path)?;
         Self::new_with_config(libos_name, config)
     }
 
@@ -123,21 +127,24 @@ impl LibOS {
             LibOSName::Catnap => Self::NetworkLibOS(NetworkLibOSWrapper::Catnap(SharedNetworkLibOS::<
                 SharedCatnapTransport,
             >::new(
+                config.local_ipv4_addr()?,
                 runtime.clone(),
-                SharedCatnapTransport::new(&config, &mut runtime),
+                SharedCatnapTransport::new(&config, &mut runtime)?,
             ))),
 
             #[cfg(feature = "catpowder-libos")]
             LibOSName::Catpowder => {
                 // TODO: Remove some of these clones once we are done merging the libOSes.
-                let transport: LinuxRuntime = LinuxRuntime::new(config.clone());
+                let transport: LinuxRuntime = LinuxRuntime::new(config.clone())?;
                 // This is our transport for Catpowder.
                 let inetstack: SharedInetStack<LinuxRuntime> =
                     SharedInetStack::<LinuxRuntime>::new(config.clone(), runtime.clone(), transport).unwrap();
                 Self::NetworkLibOS(NetworkLibOSWrapper::Catpowder(SharedNetworkLibOS::<
                     SharedInetStack<LinuxRuntime>,
                 >::new(
-                    runtime.clone(), inetstack
+                    config.local_ipv4_addr()?,
+                    runtime.clone(),
+                    inetstack,
                 )))
             },
             #[cfg(feature = "catnip-libos")]
@@ -150,7 +157,9 @@ impl LibOS {
                 Self::NetworkLibOS(NetworkLibOSWrapper::Catnip(SharedNetworkLibOS::<
                     SharedInetStack<SharedDPDKRuntime>,
                 >::new(
-                    runtime.clone(), inetstack
+                    config.local_ipv4_addr()?,
+                    runtime.clone(),
+                    inetstack,
                 )))
             },
             #[cfg(feature = "catmem-libos")]
@@ -161,8 +170,9 @@ impl LibOS {
             LibOSName::Catloop => Self::NetworkLibOS(NetworkLibOSWrapper::Catloop(SharedNetworkLibOS::<
                 SharedCatloopTransport,
             >::new(
+                config.local_ipv4_addr()?,
                 runtime.clone(),
-                SharedCatloopTransport::new(&config, runtime.clone()),
+                SharedCatloopTransport::new(&config, runtime.clone())?,
             ))),
             _ => panic!("unsupported libos"),
         };
@@ -242,6 +252,80 @@ impl LibOS {
                 LibOS::NetworkLibOS(libos) => libos.socket(domain, socket_type, protocol),
                 #[cfg(feature = "catmem-libos")]
                 LibOS::MemoryLibOS(_) => Err(Fail::new(libc::ENOTSUP, "socket() is not supported on memory liboses")),
+            }
+        };
+
+        self.poll();
+
+        result
+    }
+
+    /// Sets an SO_* option on the socket referenced by [sockqd].
+    pub fn set_socket_option(&mut self, sockqd: QDesc, option: SocketOption) -> Result<(), Fail> {
+        let result: Result<(), Fail> = {
+            match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
+                LibOS::NetworkLibOS(libos) => libos.set_socket_option(sockqd, option),
+                #[cfg(feature = "catmem-libos")]
+                LibOS::MemoryLibOS(_) => {
+                    let cause: String = format!("Socket options are not supported on memory liboses");
+                    error!("get_socket_option(): {}", cause);
+                    Err(Fail::new(libc::ENOTSUP, &cause))
+                },
+            }
+        };
+
+        self.poll();
+
+        result
+    }
+
+    /// Gets a SO_* option on the socket referenced by [sockqd].
+    pub fn get_socket_option(&mut self, sockqd: QDesc, option: SocketOption) -> Result<SocketOption, Fail> {
+        let result: Result<SocketOption, Fail> = {
+            match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
+                LibOS::NetworkLibOS(libos) => libos.get_socket_option(sockqd, option),
+                #[cfg(feature = "catmem-libos")]
+                LibOS::MemoryLibOS(_) => {
+                    let cause: String = format!("Socket options are not supported on memory liboses");
+                    error!("get_socket_option(): {}", cause);
+                    Err(Fail::new(libc::ENOTSUP, &cause))
+                },
+            }
+        };
+
+        self.poll();
+
+        result
+    }
+
+    pub fn getpeername(&mut self, sockqd: QDesc) -> Result<SocketAddrV4, Fail> {
+        let result: Result<SocketAddrV4, Fail> = {
+            match self {
+                #[cfg(any(
+                    feature = "catnap-libos",
+                    feature = "catnip-libos",
+                    feature = "catpowder-libos",
+                    feature = "catloop-libos"
+                ))]
+                LibOS::NetworkLibOS(libos) => libos.getpeername(sockqd),
+                #[cfg(feature = "catmem-libos")]
+                LibOS::MemoryLibOS(_) => {
+                    let cause: String = format!("Peername is not supported on memory liboses");
+                    error!("getpeername(): {}", cause);
+                    Err(Fail::new(libc::ENOTSUP, &cause))
+                },
             }
         };
 
@@ -516,9 +600,8 @@ impl LibOS {
     pub fn wait_next_n<Acceptor: FnMut(demi_qresult_t) -> bool>(
         &mut self,
         acceptor: Acceptor,
-        timeout: Option<Duration>
-    ) -> Result<(), Fail>
-    {
+        timeout: Option<Duration>,
+    ) -> Result<(), Fail> {
         timer!("demikernel::wait_next_n");
         match self {
             #[cfg(any(

@@ -29,6 +29,12 @@ class JobFactory:
         else:
             return linux.CompileJobOnLinux(self.config)
 
+    def install(self) -> BaseJob:
+        if self.config["platform"] == "windows":
+            raise Exception("Install is not supported on Windows")
+        else:
+            return linux.InstallJobOnLinux(self.config)
+
     def cleanup(self) -> BaseJob:
         if self.config["platform"] == "windows":
             return windows.CleanupJobOnWindows(self.config)
@@ -53,7 +59,7 @@ class JobFactory:
 
     def integration_test(self, run_mode="") -> BaseJob:
         if self.config["platform"] == "windows":
-            raise Exception("Integration tests are not supported on Windows")
+            return windows.TcpIntegrationTestJobOnWindows(self.config)
         else:
             if self.config["libos"] == "catmem":
                 return linux.PipeIntegrationTestJobOnLinux(self.config, run_mode=run_mode)
@@ -62,7 +68,22 @@ class JobFactory:
 
     def system_test(self, test_name: str, niterations: int = 0, run_mode: str = "", nclients: int = 0, bufsize: int = 0, nrequests: int = 0, nthreads: int = 1, who_closes: str = "", scenario: str = "") -> BaseJob:
         if self.config["platform"] == "windows":
-            raise Exception("System tests are not supported on Windows")
+            if test_name == "tcp_echo":
+                return windows.TcpEchoTest(self.config, run_mode, nclients, bufsize, nrequests, nthreads)
+            elif test_name == "tcp_close":
+                return windows.TcpCloseTest(self.config, run_mode=run_mode, who_closes=who_closes, nclients=nclients)
+            elif test_name == "tcp_wait":
+                return windows.TcpWaitTest(self.config, scenario=scenario, nclients=nclients)
+            elif test_name == "tcp_ping_pong":
+                return windows.TcpPingPongTest(self.config)
+            elif test_name == "tcp_push_pop":
+                return windows.TcpPushPopTest(self.config)
+            elif test_name == "udp_ping_pong":
+                return windows.UdpPingPongTest(self.config)
+            elif test_name == "udp_push_pop":
+                return windows.UdpPushPopTest(self.config)
+            else:
+                raise Exception("Invalid test name")
         else:
             if self.config["libos"] == "catmem":
                 if test_name == "open-close":
@@ -90,3 +111,39 @@ class JobFactory:
                     return linux.UdpPushPopTest(self.config)
                 else:
                     raise Exception("Invalid test name")
+
+    def clone_redis(self) -> BaseJob:
+        if self.config["platform"] == "windows":
+            raise Exception("Clone is not supported on Windows")
+        else:
+            return linux.CloneRedisJobOnLinux(self.config)
+
+    def make_redis(self) -> BaseJob:
+        if self.config["platform"] == "windows":
+            raise Exception("Make Redis is not supported on Windows")
+        else:
+            return linux.MakeRedisJobOnLinux(self.config)
+
+    def run_redis_server(self) -> BaseJob:
+        if self.config["platform"] == "windows":
+            raise Exception("Run Redis is not supported on Windows")
+        else:
+            return linux.RunRedisServerJobOnLinux(self.config)
+
+    def run_redis_benchmark(self) -> BaseJob:
+        if self.config["platform"] == "windows":
+            raise Exception("Run Redis is not supported on Windows")
+        else:
+            return linux.RunRedisBenchmarkJobOnLinux(self.config)
+
+    def stop_redis_server(self) -> BaseJob:
+        if self.config["platform"] == "windows":
+            raise Exception("Stop Redis is not supported on Windows")
+        else:
+            return linux.StopRedisServerJobOnLinux(self.config)
+
+    def cleanup_redis(self) -> BaseJob:
+        if self.config["platform"] == "windows":
+            raise Exception("Cleanup Redis is not supported on Windows")
+        else:
+            return linux.CleanupRedisJobOnLinux(self.config)

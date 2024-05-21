@@ -32,7 +32,7 @@ export BUILD_DIR := $(CURDIR)/target/release
 ifeq ($(BUILD),dev)
 export BUILD_DIR := $(CURDIR)/target/debug
 endif
-export INPUT_DIR ?= $(CURDIR)/nettest/input
+export INPUT ?= $(CURDIR)/nettest/input
 
 #=======================================================================================================================
 # Toolchain Configuration
@@ -45,7 +45,7 @@ export CARGO_FLAGS += --profile $(BUILD)
 # C
 export CFLAGS := -I $(INCDIR)
 ifeq ($(DEBUG),yes)
-export CFLAGS += -O3
+export CFLAGS += -O0
 endif
 
 #=======================================================================================================================
@@ -98,7 +98,7 @@ doc:
 install:
 	mkdir -p $(INSTALL_PREFIX)/include $(INSTALL_PREFIX)/lib
 	cp -rf $(INCDIR)/* $(INSTALL_PREFIX)/include/
-	cp -f  $(BUILD_DIR)/$(DEMIKERNEL_LIB) $(INSTALL_PREFIX)/lib/
+	cp -rf  $(LIBDIR)/* $(INSTALL_PREFIX)/lib/
 	cp -f $(CURDIR)/scripts/config/default.yaml $(INSTALL_PREFIX)/config.yaml
 
 #=======================================================================================================================

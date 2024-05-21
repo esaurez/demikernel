@@ -33,7 +33,6 @@ extern "C"
     ATTR_NONNULL(2)
     extern int demi_init(_In_ int argc, _In_reads_(argc) _Deref_pre_z_ char *const argv[]);
 
-
     /**
      * @brief Creates a new memory I/O queue.
      *
@@ -116,7 +115,6 @@ extern "C"
     extern int demi_connect(_Out_ demi_qtoken_t *qt_out, _In_ int sockqd,
                             _In_reads_bytes_(size) const struct sockaddr *addr, _In_ socklen_t size);
 
-
     /**
      * @brief Closes an I/O queue descriptor.
      *
@@ -163,6 +161,45 @@ extern "C"
      */
     ATTR_NONNULL(1)
     extern int demi_pop(_Out_ demi_qtoken_t *qt_out, _In_ int qd);
+
+    /**
+     * @brief Sets socket options.
+     *
+     * @param qd     Target I/O queue descriptor.
+     * @param level  Protocol level at which the option resides.
+     * @param optname Socket option for which the value is to be set.
+     * @param optval Pointer to the buffer containing the option value.
+     * @param optlen Size of the buffer containing the option value.
+     *
+     * @return On successful completion, zero is returned. On failure, a positive error code is returned instead.
+     */
+    ATTR_NONNULL(4)
+    extern int demi_setsockopt(_In_ int qd, _In_ int level, _In_ int optname, _In_reads_bytes_(optlen) const void *optval, _In_ socklen_t optlen);
+
+    /**
+     * @brief Gets socket options.
+     *
+     * @param qd     Target I/O queue descriptor.
+     * @param level  Protocol level at which the option resides.
+     * @param optname Socket option for which the value is to be retrieved.
+     * @param optval Pointer to the buffer containing the option value.
+     * @param optlen Size of the buffer containing the option value.
+     *
+     * @return On successful completion, zero is returned. On failure, a positive error code is returned instead.
+     */
+    ATTR_NONNULL(4)
+    extern int demi_getsockopt(_In_ int qd, _In_ int level, _In_ int optname, _Out_writes_to_(optlen, *optlen) void *optval, _In_ socklen_t *optlen);
+
+    /**
+     * @brief Returns the address of the peer connected to qd.
+     *
+     * @param addr    Peer address is returned in this parameter.
+     * @param addrlen Indicates the amount of space pointed to by addr
+     *
+     * @return On success, zero is returned. On failure, a possitive error code is returned.
+     */
+    ATTR_NONNULL(2, 3)
+    extern int demi_getpeername(_In_ int qd, _Out_ struct sockaddr *addr, _Out_ socklen_t *addrlen);
 
 #ifdef __cplusplus
 }

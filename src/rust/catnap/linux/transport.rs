@@ -27,7 +27,13 @@ use crate::{
             DemiBuffer,
             MemoryRuntime,
         },
-        network::transport::NetworkTransport,
+        network::{
+            socket::option::{
+                SocketOption,
+                TcpSocketOptions,
+            },
+            transport::NetworkTransport,
+        },
         poll_yield,
         DemiRuntime,
         SharedDemiRuntime,
@@ -47,6 +53,7 @@ use ::std::{
     net::{
         Shutdown,
         SocketAddr,
+        SocketAddrV4,
     },
     ops::{
         Deref,
@@ -74,6 +81,7 @@ pub struct CatnapTransport {
     epoll_fd: RawFd,
     socket_table: Slab<SharedSocketData>,
     runtime: SharedDemiRuntime,
+    options: TcpSocketOptions,
 }
 
 /// Shared network transport across coroutines.
@@ -89,7 +97,7 @@ type SockDesc = <SharedCatnapTransport as NetworkTransport>::SocketDescriptor;
 
 impl SharedCatnapTransport {
     /// Create a new Linux-based network transport.
-    pub fn new(_config: &Config, runtime: &mut SharedDemiRuntime) -> Self {
+    pub fn new(config: &Config, runtime: &mut SharedDemiRuntime) -> Result<Self, Fail> {
         // Create epoll socket.
         // Linux ignores the size argument to epoll, it just has to be more than 0.
         let epoll_fd: RawFd = match unsafe { libc::epoll_create(10) } {
@@ -105,16 +113,14 @@ impl SharedCatnapTransport {
             epoll_fd,
             socket_table: Slab::<SharedSocketData>::new(),
             runtime: runtime.clone(),
+            options: TcpSocketOptions::new(config)?,
         }));
         let mut me2: Self = me.clone();
-        expect_ok!(
-            runtime.insert_background_coroutine(
-                "catnap::transport::epoll",
-                Box::pin(async move { me2.poll().await }.fuse()),
-            ),
-            "should be able to insert background coroutine"
-        );
-        me
+        runtime.insert_background_coroutine(
+            "catnap::transport::epoll",
+            Box::pin(async move { me2.poll().await }.fuse()),
+        )?;
+        Ok(me)
     }
 
     /// This function registers a handler for incoming and outgoing I/O on the socket. There should only be one of
@@ -280,8 +286,18 @@ impl NetworkTransport for SharedCatnapTransport {
             Type::STREAM => Protocol::TCP,
             Type::DGRAM => Protocol::UDP,
             _ => {
-                return Err(Fail::new(libc::ENOTSUP, "socket type not supported"));
+                let cause: String = format!("socket type not supported: {:?}", typ);
+                error!("socket(): {}", cause);
+                return Err(Fail::new(libc::ENOTSUP, &cause));
             },
+        };
+
+        // Attempts to shutdown a socket. If we fail, log a warn message and do not overwrite the original error.
+        let attempt_shutdown = |socket: Socket| {
+            if let Err(e) = socket.shutdown(Shutdown::Both) {
+                let cause: String = format!("cannot shutdown socket: {:?}", e);
+                warn!("socket(): {}", cause);
+            }
         };
 
         // Create socket.
@@ -290,24 +306,32 @@ impl NetworkTransport for SharedCatnapTransport {
                 // Set socket options.
                 if let Err(e) = socket.set_reuse_address(true) {
                     let cause: String = format!("cannot set REUSE_ADDRESS option: {:?}", e);
-                    socket.shutdown(Shutdown::Both)?;
-                    error!("new(): {}", cause);
-                    return Err(Fail::new(get_libc_err(e), &cause));
+                    let errno: i32 = get_libc_err(e);
+                    error!("socket(): {}", cause);
+                    attempt_shutdown(socket);
+                    return Err(Fail::new(errno, &cause));
                 }
-                if let Err(e) = socket.set_nonblocking(true) {
-                    let cause: String = format!("cannot set NONBLOCKING option: {:?}", e);
-                    socket.shutdown(Shutdown::Both)?;
-                    error!("new(): {}", cause);
-                    return Err(Fail::new(get_libc_err(e), &cause));
+
+                let socket_fd = socket.as_raw_fd();
+                let flags = unsafe { libc::fcntl(socket_fd, libc::F_GETFL) };
+                if flags & libc::O_NONBLOCK == 0 {
+                    if let Err(e) = socket.set_nonblocking(true) {
+                        let cause: String = format!("cannot set NONBLOCKING option: {:?}", e);
+                        let errno: i32 = get_libc_err(e);
+                        error!("socket(): {}", cause);
+                        attempt_shutdown(socket);
+                        return Err(Fail::new(errno, &cause));
+                    }
                 }
 
                 // Set TCP socket options
                 if typ == Type::STREAM {
-                    if let Err(e) = socket.set_nodelay(true) {
+                    if let Err(e) = socket.set_nodelay(self.options.get_nodelay()) {
                         let cause: String = format!("cannot set TCP_NODELAY option: {:?}", e);
-                        socket.shutdown(Shutdown::Both)?;
-                        error!("new(): {}", cause);
-                        return Err(Fail::new(get_libc_err(e), &cause));
+                        let errno: i32 = get_libc_err(e);
+                        error!("socket(): {}", cause);
+                        attempt_shutdown(socket);
+                        return Err(Fail::new(errno, &cause));
                     }
                 }
 
@@ -329,6 +353,105 @@ impl NetworkTransport for SharedCatnapTransport {
             _ => unreachable!("We should have returned an error by now"),
         };
         Ok(sd)
+    }
+
+    /// Set an SO_* option on the socket.
+    fn set_socket_option(&mut self, sd: &mut Self::SocketDescriptor, option: SocketOption) -> Result<(), Fail> {
+        trace!("Set socket option to {:?}", option);
+        let socket: &mut Socket = self.socket_from_sd(sd);
+        match option {
+            SocketOption::Linger(linger) => {
+                if let Err(e) = socket.set_linger(linger) {
+                    let errno: i32 = get_libc_err(e);
+                    let cause: String = format!("SO_LINGER failed: {:?}", errno);
+                    error!("set_socket_option(): {}", cause);
+                    Err(Fail::new(errno, &cause))
+                } else {
+                    Ok(())
+                }
+            },
+            SocketOption::KeepAlive(alive) => {
+                if let Err(e) = socket.set_keepalive(alive) {
+                    let errno: i32 = get_libc_err(e);
+                    let cause: String = format!("SO_KEEPALIVE failed: {:?}", errno);
+                    error!("set_socket_option(): {}", cause);
+                    Err(Fail::new(errno, &cause))
+                } else {
+                    Ok(())
+                }
+            },
+            SocketOption::NoDelay(nagle_off) => {
+                if let Err(e) = socket.set_nodelay(nagle_off) {
+                    let errno: i32 = get_libc_err(e);
+                    let cause: String = format!("SO_TCP_NO_DELAY failed: {:?}", errno);
+                    error!("set_socket_option(): {}", cause);
+                    Err(Fail::new(errno, &cause))
+                } else {
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    /// Gets an SO_* option on the socket. The option should be passed in as [option] and the value returned is either
+    /// an error or must match [option] with a value.
+    fn get_socket_option(
+        &mut self,
+        sd: &mut Self::SocketDescriptor,
+        option: SocketOption,
+    ) -> Result<SocketOption, Fail> {
+        trace!("Set socket option to {:?}", option);
+        let socket: &mut Socket = self.socket_from_sd(sd);
+        match option {
+            SocketOption::Linger(_) => match socket.linger() {
+                Ok(linger) => Ok(SocketOption::Linger(linger)),
+                Err(e) => {
+                    let errno: i32 = get_libc_err(e);
+                    let cause: String = format!("SO_LINGER failed: {:?}", errno);
+                    error!("set_socket_option(): {}", cause);
+                    Err(Fail::new(errno, &cause))
+                },
+            },
+            SocketOption::KeepAlive(_) => match socket.keepalive() {
+                Ok(keepalive) => Ok(SocketOption::KeepAlive(keepalive)),
+                Err(e) => {
+                    let errno: i32 = get_libc_err(e);
+                    let cause: String = format!("SO_KEEPALIVE failed: {:?}", errno);
+                    error!("set_socket_option(): {}", cause);
+                    Err(Fail::new(errno, &cause))
+                },
+            },
+            SocketOption::NoDelay(_) => match socket.nodelay() {
+                Ok(nagle_off) => Ok(SocketOption::NoDelay(nagle_off)),
+                Err(e) => {
+                    let errno: i32 = get_libc_err(e);
+                    let cause: String = format!("SO_TCP_NO_DELAY failed: {:?}", errno);
+                    error!("set_socket_option(): {}", cause);
+                    Err(Fail::new(errno, &cause))
+                },
+            },
+        }
+    }
+
+    // Gets peer name of connected socket.
+    fn getpeername(&mut self, sd: &mut Self::SocketDescriptor) -> Result<SocketAddrV4, Fail> {
+        let socket: &mut Socket = self.socket_from_sd(sd);
+        match socket.peer_addr() {
+            Ok(addr) => match addr.as_socket_ipv4() {
+                Some(ipv4_addr) => Ok(ipv4_addr),
+                None => {
+                    let cause: String = format!("invalid IPv4 address");
+                    error!("getpeername(): {}", cause);
+                    Err(Fail::new(libc::EINVAL, &cause))
+                },
+            },
+            Err(e) => {
+                let errno: i32 = get_libc_err(e);
+                let cause: String = format!("failed to get peer name (errno={:?})", errno);
+                error!("getpeername(): {}", cause);
+                Err(Fail::new(errno, &cause))
+            },
+        }
     }
 
     /// Binds a socket to [local] on the underlying network transport.
