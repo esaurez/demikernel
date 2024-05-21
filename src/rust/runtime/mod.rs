@@ -93,6 +93,11 @@ use std::pin::Pin;
 const TIMER_RESOLUTION: usize = 64;
 const TIMER_FINER_RESOLUTION: usize = 2;
 
+fn get_current_rdtscp() -> u64 {
+    let (now, _): (u64, u32) = unsafe { x86::time::rdtscp() };
+    now
+}
+
 //======================================================================================================================
 // Structures
 //======================================================================================================================
@@ -111,6 +116,8 @@ pub struct DemiRuntime {
     ts_iters: usize,
     /// Tasks that have been completed and removed from the
     completed_tasks: HashMap<QToken, (QDesc, OperationResult)>,
+    poll_vec_profile: Vec<Vec<u64>>,
+    current_index: usize,
 }
 
 #[derive(Clone)]
@@ -147,6 +154,8 @@ impl SharedDemiRuntime {
             network_table: NetworkQueueTable::default(),
             ts_iters: 0,
             completed_tasks: HashMap::<QToken, (QDesc, OperationResult)>::new(),
+            poll_vec_profile: vec![vec![0;11]; 20000],
+            current_index: 0,
         }))
     }
 
@@ -246,12 +255,47 @@ impl SharedDemiRuntime {
         }
     }
 
+    pub fn print_profile(&mut self) {
+        println!("Printing profile");
+        for i in 0..self.current_index {
+            let current_profile = &self.poll_vec_profile[i];
+            println!(
+                "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                current_profile[0],
+                current_profile[1],
+                current_profile[2],
+                current_profile[3],
+                current_profile[4],
+                current_profile[5],
+                current_profile[6],
+                current_profile[7],
+                current_profile[8],
+                current_profile[9],
+                current_profile[10],
+            );
+        }
+        self.current_index = 0;
+    }
+
     /// Waits until one of the tasks in qts has completed and returns the result.
     pub fn wait_any(
         &mut self,
         qts: &[QToken],
         timeout: Duration,
     ) -> Result<(usize, QToken, QDesc, OperationResult), Fail> {
+
+        { // Borrow scope
+            if self.current_index == 20000 {
+                self.print_profile();
+            }
+        }
+        let current_index = self.current_index;
+        { // Borrow scope
+           let current_profile = &mut self.poll_vec_profile[current_index];
+           current_profile[0] = get_current_rdtscp();
+           current_profile[7] = u64::MAX;
+           current_profile[9] = 0;
+        }
         for (i, qt) in qts.iter().enumerate() {
             // 1. Check if any of these queue tokens point to already completed tasks.
             if let Some((qd, result)) = self.get_completed_task(&qt) {
@@ -266,15 +310,53 @@ impl SharedDemiRuntime {
             }
         }
 
+        { // Borrow scope
+          let current_profile = &mut self.poll_vec_profile[current_index];
+          current_profile[1] = get_current_rdtscp();
+        }
+
         // 3. None of the tasks have already completed, so start a timer and move the clock.
         self.advance_clock_to_now();
         let mut prev_time: Instant = self.get_now();
         let mut remaining_time: Duration = timeout;
 
+        let mut loop_begin: u64;
+        { // Borrow scope
+          let current_profile = &mut self.poll_vec_profile[current_index];
+          current_profile[2] = get_current_rdtscp();
+          loop_begin = current_profile[2];
+        }
+
+        let mut count: u64 = 0;
+
         // 4. Invoke the scheduler and run some tasks.
         loop {
+            let interesting: bool;
+
             // Run for one quanta and if one of our queue tokens completed, then return.
             if let Some((i, qd, result)) = self.run_any(qts, remaining_time) {
+                { // Borrow scope
+                  let current_profile = &mut self.poll_vec_profile[current_index];
+                  current_profile[3] = get_current_rdtscp();
+                  current_profile[6] = count;
+                  interesting = current_profile[3] - current_profile[0] > 100000;
+                  if current_profile[3] - loop_begin  < current_profile[7] {
+                    current_profile[7] = current_profile[3] - loop_begin;  
+                    current_profile[8] = count;
+                  }
+                  if current_profile[3] - loop_begin > current_profile[9] {
+                    current_profile[9] = current_profile[3] - loop_begin;
+                    current_profile[10] = count;
+                  }
+                }
+                if interesting {
+                    self.current_index += 1;
+                } else {
+                  let current_profile = &mut self.poll_vec_profile[current_index];
+                  for idx in 0..10 {
+                    current_profile[idx] = 0;
+                  }
+                }
                 return Ok((i, qts[i], qd, result));
             }
             // Otherwise, move time forward.
@@ -282,11 +364,50 @@ impl SharedDemiRuntime {
             let now: Instant = self.get_now();
             let time_elapsed: Duration = now - prev_time;
 
+            { // Borrow scope
+                let current_profile = &mut self.poll_vec_profile[current_index];
+                current_profile[4] = get_current_rdtscp();
+            }
+
             if time_elapsed > remaining_time {
+                { // Borrow scope
+                    let current_profile = &mut self.poll_vec_profile[current_index];
+                    current_profile[5] = get_current_rdtscp();
+                    current_profile[6] = count;
+                    interesting = current_profile[5] - current_profile[0] > 100000;
+                    if current_profile[3] - loop_begin  < current_profile[7] {
+                        current_profile[7] = current_profile[5] - loop_begin;
+                        current_profile[8] = count;
+                    }
+                    if current_profile[3] - loop_begin > current_profile[9] {
+                        current_profile[9] = current_profile[5] - loop_begin;
+                        current_profile[10] = count;
+                    }
+                }
+                if interesting {
+                    self.current_index += 1;
+                } else {
+                  let current_profile = &mut self.poll_vec_profile[current_index];
+                  for idx in 0..10 {
+                    current_profile[idx] = 0;
+                  }
+                }
                 return Err(Fail::new(libc::ETIMEDOUT, "wait timed out"));
             } else {
+		let current_profile = &mut self.poll_vec_profile[current_index];
                 remaining_time = remaining_time - time_elapsed;
                 prev_time = now;
+                count += 1;
+                let new_loop = get_current_rdtscp();
+                if new_loop - loop_begin  < current_profile[7] {
+                    current_profile[7] = new_loop - loop_begin;
+                    current_profile[8] = count;
+                }
+                if new_loop - loop_begin > current_profile[9] {
+                    current_profile[9] = new_loop - loop_begin;
+                    current_profile[10] = count;
+                }
+                loop_begin = new_loop;
             }
         }
     }
@@ -598,6 +719,8 @@ impl Default for SharedDemiRuntime {
             network_table: NetworkQueueTable::default(),
             ts_iters: 0,
             completed_tasks: HashMap::<QToken, (QDesc, OperationResult)>::new(),
+            poll_vec_profile: vec![vec![0;11]; 20000],
+            current_index: 0,
         }))
     }
 }

@@ -271,6 +271,21 @@ impl NetworkLibOSWrapper {
     }
 
     /// Waits for any of the given pending I/O operations to complete or a timeout to expire.
+    pub fn print_profile(&mut self) {
+        match self {
+            #[cfg(feature = "catpowder-libos")]
+            NetworkLibOSWrapper::Catpowder(libos) => libos.print_profile(),
+            #[cfg(all(feature = "catnap-libos"))]
+            NetworkLibOSWrapper::Catnap(libos) => libos.print_profile(),
+            #[cfg(feature = "catnip-libos")]
+            NetworkLibOSWrapper::Catnip(libos) => libos.print_profile(),
+            #[cfg(feature = "catloop-libos")]
+            NetworkLibOSWrapper::Catloop(libos) => libos.print_profile(),
+        }
+    }
+
+
+    /// Waits for any of the given pending I/O operations to complete or a timeout to expire.
     pub fn wait_any(&mut self, qts: &[QToken], timeout: Duration) -> Result<(usize, demi_qresult_t), Fail> {
         match self {
             #[cfg(feature = "catpowder-libos")]

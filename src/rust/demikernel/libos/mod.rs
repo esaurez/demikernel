@@ -577,6 +577,22 @@ impl LibOS {
         }
     }
 
+
+    /// Waits for any of the given pending I/O operations to complete or a timeout to expire.
+    pub fn print_profile(&mut self) {
+        match self {
+            #[cfg(any(
+                feature = "catnap-libos",
+                feature = "catnip-libos",
+                feature = "catpowder-libos",
+                feature = "catloop-libos"
+            ))]
+            LibOS::NetworkLibOS(libos) => libos.print_profile(),
+            #[cfg(feature = "catmem-libos")]
+            LibOS::MemoryLibOS(libos) => libos.print_profile(),
+        }
+    }
+
     /// Waits for any of the given pending I/O operations to complete or a timeout to expire.
     pub fn wait_any(&mut self, qts: &[QToken], timeout: Option<Duration>) -> Result<(usize, demi_qresult_t), Fail> {
         timer!("demikernel::wait_any");
