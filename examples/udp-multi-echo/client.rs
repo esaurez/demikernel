@@ -122,8 +122,7 @@ impl UdpEchoClient {
         nrequests: Option<usize>,
         niterations: usize,
     ) -> Result<()> {
-        let udp_wait_timeout = Duration::from_micros(50);
-        let mut last_log: Instant = Instant::now();
+        let udp_wait_timeout = Duration::from_micros(250);
 
         for iter in 0..niterations {
             println!("INFO: Starting iteration {}", iter);
@@ -131,6 +130,7 @@ impl UdpEchoClient {
             self.npushed = 0;
             self.nbytes = 0;
             self.retried = 0;
+            let mut last_log: Instant = Instant::now();
             self.start = Instant::now();
             self.stats = Histogram::new(7, 64)?;
 
@@ -176,12 +176,12 @@ impl UdpEchoClient {
                     },
                     Err(e) => {
                         if e.errno == libc::ETIMEDOUT {
-                            // 50 us timeout expired.
+                            // 250 us timeout expired.
                             self.retried += 1;
                             // Push a message to all clients.
                             let clients = self.clients.clone();
-                            for (sockqd, (_, _, _, _, last_time)) in clients.iter() {
-                                self.issue_push(sockqd.clone(), Some(*last_time))?;
+                            for (sockqd, _) in clients.iter() {
+                                self.issue_push(sockqd.clone(), None)?;
                             }
                             continue;
                         } else {
@@ -203,18 +203,19 @@ impl UdpEchoClient {
             }
 
             if let Some(nrequests) = nrequests {
-                let time_elapsed: f64 = (Instant::now() - last_log).as_secs() as f64;
+                let time_now = Instant::now();
+                let time_elapsed: f64 = (time_now - last_log).as_secs() as f64;
 
-                print!("INFO: Printing for {} requests", nrequests);
+                println!("INFO: Printing for {} requests", nrequests);
+
+                self.print_stats(time_elapsed)?;
 
                 // For each client print the average latency, using the start time in start_time
-                let time_now = Instant::now();
                 for (_qd, (_buf, _index, start, num_messages, _last_message_time)) in &self.clients {
                     let time_elapsed: u64 = (time_now - *start).as_nanos() as u64;
                     let average: u64 = time_elapsed / *num_messages as u64;
-                    println!("INFO: Average latency {:?} ns", average);
+                    println!("INFO: Average latency {:?} ns with time elapsed {} for {} messages with end at {} and begin at {}", average, time_elapsed, num_messages, time_now.duration_since(self.start).as_nanos(), start.duration_since(self.start).as_nanos());
                 }
-                self.print_stats(time_elapsed)?;
             }
 
             println!(
@@ -339,6 +340,7 @@ impl UdpEchoClient {
             ]);
             let now: u64 = Instant::now().duration_since(self.start).as_nanos() as u64;
             let elapsed: u64 = now - timestamp;
+            // println!("Current: {}, prev: {}, elapsed: {}", now, timestamp, elapsed);
             self.stats.increment(elapsed)?;
 
             self.libos.sgafree(sga)?;
@@ -403,6 +405,7 @@ impl UdpEchoClient {
         } else {
             Instant::now().duration_since(self.start).as_nanos() as u64
         };
+        // println!("Sending message with time {}", message_time);
         let sga: demi_sgarray_t = self.mksga(self.bufsize, message_time, false)?;
         let qt: QToken = self.libos.pushto(qd, &sga, self.remote)?;
         self.register_operation(qt);
