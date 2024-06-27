@@ -179,6 +179,20 @@ impl TcpEchoClient {
             }
         }
 
+        let time_elapsed: f64 = (Instant::now() - last_log).as_secs() as f64;
+        let nrequests: f64 = (self.nbytes / self.bufsize) as f64;
+        let rps: f64 = nrequests / time_elapsed;
+        println!(
+            "INFO: {:?} requests, {:2?} rps, p50 {:?} ns, p99 {:?} ns",
+            nrequests,
+            rps,
+            self.stats.percentile(0.50)?.start(),
+            self.stats.percentile(0.99)?.start()
+        );
+        last_log = Instant::now();
+        self.nbytes = 0;
+
+
         // Close all connections.
         for (qd, _) in self.clients.drain().collect::<Vec<_>>() {
             self.handle_close(qd)?;

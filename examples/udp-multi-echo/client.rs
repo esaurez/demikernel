@@ -122,7 +122,7 @@ impl UdpEchoClient {
         nrequests: Option<usize>,
         niterations: usize,
     ) -> Result<()> {
-        let udp_wait_timeout = Duration::from_micros(250);
+        let udp_wait_timeout = Duration::from_micros(1000);
 
         for iter in 0..niterations {
             println!("INFO: Starting iteration {}", iter);
